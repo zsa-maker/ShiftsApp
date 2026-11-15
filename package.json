@@ -4,7 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "cd shifts-client && npm install && npm run build",
+    "start": "node server.js",
+    "deploy-ready": "npm install && npm run build && node server.js"
   },
   "keywords": [],
   "author": "",
@@ -15,6 +17,7 @@
     "date-fns": "^4.3.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "firebase-admin": "^14.5.1",
     "googleapis": "^174.0.1",
     "react-big-calendar": "^1.19.4",
     "react-draggable": "^4.5.0",
