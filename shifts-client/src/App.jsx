@@ -629,27 +629,28 @@ function App() {
       .catch(err => console.error("שגיאה בעדכון:", err));
   };
 
+  // התראה מיידית בעת שינוי שדות בטופס
   const checkConflict = (userId, start, end, shiftTypeId) => {
-    if (!userId || !start || !end) return;
-
-    const selectedUser = users.find(u => String(u.id) === String(userId));
-    const selectedType = shiftTypes.find(t => String(t.id) === String(shiftTypeId));
-    if (!selectedUser) return;
-
-    const userExemptions = selectedUser.exemptionIds || [];
-
-    if (userExemptions.includes(4) && doesRangeContainShabbat(start, end)) {
-      alert(`⚠️ התראה: ל-${selectedUser.full_name} יש פטור שבתות, והטווח הנבחר כולל שבת!`);
+    const result = validateShift(userId, shiftTypeId, start, end, doesRangeContainShabbat(start, end));
+    if (result !== true) {
+      alert(`⚠️ התראה: ${result}`);
     }
+  };
 
-    if (selectedType) {
-      if (userExemptions.includes(1) && selectedType.name.includes('מטבח')) {
-        alert(`⚠️ התראה: ל-${selectedUser.full_name} יש פטור מטבח!`);
+  // סינון רשימת החיילים כך שיציג רק חיילים זמינים (או יסמן חסומים)
+  const getAvailableSoldiers = (startDate = formData.startDate, endDate = formData.endDate, shiftTypeId = formData.shiftTypeId) => {
+    return users.filter(u => {
+      if (u.is_active !== 1 || u.does_shifts !== 1) return false;
+      // אם נבחרו תאריכים או סוג תורנות, סנן חיילים שיש להם אילוץ או פטור מתאים
+      if (startDate && endDate) {
+        const isValid = validateShift(u.id, shiftTypeId, startDate, endDate, doesRangeContainShabbat(startDate, endDate));
+        // משאירים ברשימה את החייל שכבר משובץ לתורנות הנוכחית בעריכה, אך מסננים אחרים שחסומים
+        if (isValid !== true && String(u.id) !== String(formData.userId)) {
+          return false;
+        }
       }
-      if (userExemptions.includes(2) && selectedType.name.includes('שמירה')) {
-        alert(`⚠️ התראה: ל-${selectedUser.full_name} יש פטור שמירה!`);
-      }
-    }
+      return true;
+    });
   };
 
   const handleUpdateSoldier = (id, fullName, password, releaseDate, potentialReduction, exemptionIds) => {
@@ -734,10 +735,6 @@ function App() {
     }
   };
 
-  const getAvailableSoldiers = () => {
-    return users.filter(u => u.is_active === 1 && u.does_shifts === 1);
-  };
-
   const checkIsDateWithinWeek = (targetDate) => {
     if (!targetDate) return false;
     const today = new Date();
@@ -750,17 +747,98 @@ function App() {
   const forcedBaltam = !editingShiftId && checkIsDateWithinWeek(formData.startDate);
   const displayBaltam = forcedBaltam || formData.isBaltam;
 
-  const validateShift = (userId, shiftTypeId) => {
+  // בדיקה מרכזית של פטורים ואילוצים עבור חייל, טווח תאריכים וסוג תורנות
+  const validateShift = (userId, shiftTypeId, startDate = formData.startDate, endDate = formData.endDate, isWeekendFlag = formData.isWeekend) => {
+    if (!userId || !startDate || !endDate) return true;
+
     const selectedUser = users.find(u => String(u.id) === String(userId));
+    if (!selectedUser) return true;
+
     const selectedType = shiftTypes.find(t => String(t.id) === String(shiftTypeId));
+    const sStart = new Date(`${startDate.split('T')[0]}T00:00:00`);
+    const sEnd = new Date(`${endDate.split('T')[0]}T23:59:59`);
 
-    if (!selectedUser || !selectedType) return true;
+    // 1. בדיקת תאריך שחרור
+    if (selectedUser.release_date) {
+      const releaseDate = new Date(`${selectedUser.release_date.split('T')[0]}T00:00:00`);
+      if (sEnd > releaseDate) {
+        return `החייל ${selectedUser.full_name} משתחרר בתאריך ${formatDateHe(selectedUser.release_date)}!`;
+      }
+    }
+    // 2. בדיקת אילוצים (חייל ספציפי, גף, או כלל הטייסת)
+    const conflictingConstraint = constraints.find(c => {
+      const cStart = new Date(`${c.originalStart.split('T')[0]}T00:00:00`);
+      const cEnd = new Date(`${c.originalEnd.split('T')[0]}T23:59:59`);
+      const isOverlapping = sStart <= cEnd && sEnd >= cStart;
+      if (!isOverlapping) return false;
 
-    const userExemptions = selectedUser.exemptionIds || [];
-    if (userExemptions.includes(1) && selectedType.name.includes('מטבח')) return "לחייל זה יש פטור מטבח!";
-    if (userExemptions.includes(2) && selectedType.name.includes('שמירה')) return "לחייל זה יש פטור שמירות!";
-    if (userExemptions.includes(3) && selectedType.name.includes('רס"ר')) return "לחייל זה יש פטור רס\"ר!";
-    if (userExemptions.includes(4) && formData.isWeekend) return "לחייל זה יש פטור שבתות!";
+      // אילוץ של החייל עצמו
+      if (c.userId && String(c.userId) === String(selectedUser.id)) return true;
+
+      // אילוץ של הגף של החייל
+      if (
+        c.division &&
+        c.division !== 'לא מוגדר' &&
+        c.division.trim() !== '' &&
+        selectedUser.division &&
+        c.division.trim() === selectedUser.division.trim()
+      ) {
+        return true;
+      }
+
+      // אילוץ טייסתי כללי (ללא חייל וללא גף)
+      if (!c.userId && (!c.division || c.division === 'לא מוגדר' || c.division.trim() === '')) {
+        return true;
+      }
+
+      return false;
+    });
+
+    if (conflictingConstraint) {
+      return `קיים אילוץ בתאריכים אלו (${conflictingConstraint.title})!`;
+    }
+
+    // 3. חילוץ שמות ומזהי הפטורים של החייל (תומך גם ב-String וגם ב-Number)
+    const rawExemptions = selectedUser.exemptionIds || [];
+    const userExemptionIdsStr = rawExemptions.map(id => String(id));
+    const userExemptionNames = rawExemptions.map(id => {
+      const found = exemptionTypes.find(e => String(e.id) === String(id));
+      return found ? found.name : String(id);
+    });
+
+    const hasExemption = (idNum, keyword) =>
+      userExemptionIdsStr.includes(String(idNum)) ||
+      userExemptionNames.some(name => name.includes(keyword));
+
+    // 4. בדיקת פטור שבתות
+    const isShabbatInRange = isWeekendFlag || doesRangeContainShabbat(startDate, endDate);
+    if (isShabbatInRange && hasExemption(4, 'שבת')) {
+      return `ל-${selectedUser.full_name} יש פטור שבתות!`;
+    }
+
+    // 5. בדיקות תלויות סוג תורנות (מטבח, שמירות, רס"ר, מגדר)
+    if (selectedType) {
+      const typeName = selectedType.name || '';
+
+      if (typeName.includes('מטבח') && hasExemption(1, 'מטבח')) {
+        return `ל-${selectedUser.full_name} יש פטור מטבח!`;
+      }
+      if (typeName.includes('שמיר') && hasExemption(2, 'שמיר')) {
+        return `ל-${selectedUser.full_name} יש פטור שמירות!`;
+      }
+      if ((typeName.includes('רס"ר') || typeName.includes('רסר')) && (hasExemption(3, 'רס"ר') || hasExemption(3, 'רסר'))) {
+        return `ל-${selectedUser.full_name} יש פטור רס"ר!`;
+      }
+
+      if (
+        selectedType.gender_limit &&
+        selectedType.gender_limit !== 'all' &&
+        selectedUser.gender &&
+        selectedType.gender_limit !== selectedUser.gender
+      ) {
+        return `תורנות זו מוגדרת עבור ${selectedType.gender_limit === 'male' ? 'בנים בלבד' : 'בנות בלבד'}!`;
+      }
+    }
 
     return true;
   };
@@ -910,15 +988,28 @@ function App() {
     setIsDuplicateModalOpen(true);
   };
 
-  const handleSaveDuplicate = () => {
+const handleSaveDuplicate = () => {
     if (!duplicateFormData.startDate || !duplicateFormData.endDate || !duplicateFormData.userId) {
       alert('חובה למלא תאריכים וחייל!');
       return;
     }
 
+    const isWeekendDup = doesRangeContainShabbat(duplicateFormData.startDate, duplicateFormData.endDate);
+    const validationResult = validateShift(
+      duplicateFormData.userId,
+      shiftToDuplicate.shiftTypeId,
+      duplicateFormData.startDate,
+      duplicateFormData.endDate,
+      isWeekendDup
+    );
+
+    if (validationResult !== true) {
+      alert(`⚠️ שיבוץ לא תקין: ${validationResult}`);
+      return;
+    }
+
     const isWithinWeek = checkIsDateWithinWeek(duplicateFormData.startDate);
     const finalBaltam = isWithinWeek ? true : shiftToDuplicate.isBaltam;
-    const isWeekendDup = doesRangeContainShabbat(duplicateFormData.startDate, duplicateFormData.endDate);
 
     fetch(`${API_BASE}/api/shifts`, {
       method: 'POST',
