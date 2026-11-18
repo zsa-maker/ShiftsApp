@@ -629,27 +629,28 @@ function App() {
       .catch(err => console.error("שגיאה בעדכון:", err));
   };
 
+  // התראה מיידית בעת שינוי שדות בטופס
   const checkConflict = (userId, start, end, shiftTypeId) => {
-    if (!userId || !start || !end) return;
-
-    const selectedUser = users.find(u => String(u.id) === String(userId));
-    const selectedType = shiftTypes.find(t => String(t.id) === String(shiftTypeId));
-    if (!selectedUser) return;
-
-    const userExemptions = selectedUser.exemptionIds || [];
-
-    if (userExemptions.includes(4) && doesRangeContainShabbat(start, end)) {
-      alert(`⚠️ התראה: ל-${selectedUser.full_name} יש פטור שבתות, והטווח הנבחר כולל שבת!`);
+    const result = validateShift(userId, shiftTypeId, start, end, doesRangeContainShabbat(start, end));
+    if (result !== true) {
+      alert(`⚠️ התראה: ${result}`);
     }
+  };
 
-    if (selectedType) {
-      if (userExemptions.includes(1) && selectedType.name.includes('מטבח')) {
-        alert(`⚠️ התראה: ל-${selectedUser.full_name} יש פטור מטבח!`);
+  // סינון רשימת החיילים כך שיציג רק חיילים זמינים (או יסמן חסומים)
+  const getAvailableSoldiers = (startDate = formData.startDate, endDate = formData.endDate, shiftTypeId = formData.shiftTypeId) => {
+    return users.filter(u => {
+      if (u.is_active !== 1 || u.does_shifts !== 1) return false;
+      // אם נבחרו תאריכים או סוג תורנות, סנן חיילים שיש להם אילוץ או פטור מתאים
+      if (startDate && endDate) {
+        const isValid = validateShift(u.id, shiftTypeId, startDate, endDate, doesRangeContainShabbat(startDate, endDate));
+        // משאירים ברשימה את החייל שכבר משובץ לתורנות הנוכחית בעריכה, אך מסננים אחרים שחסומים
+        if (isValid !== true && String(u.id) !== String(formData.userId)) {
+          return false;
+        }
       }
-      if (userExemptions.includes(2) && selectedType.name.includes('שמירה')) {
-        alert(`⚠️ התראה: ל-${selectedUser.full_name} יש פטור שמירה!`);
-      }
-    }
+      return true;
+    });
   };
 
   const handleUpdateSoldier = (id, fullName, password, releaseDate, potentialReduction, exemptionIds) => {
@@ -734,10 +735,6 @@ function App() {
     }
   };
 
-  const getAvailableSoldiers = () => {
-    return users.filter(u => u.is_active === 1 && u.does_shifts === 1);
-  };
-
   const checkIsDateWithinWeek = (targetDate) => {
     if (!targetDate) return false;
     const today = new Date();
@@ -750,17 +747,98 @@ function App() {
   const forcedBaltam = !editingShiftId && checkIsDateWithinWeek(formData.startDate);
   const displayBaltam = forcedBaltam || formData.isBaltam;
 
-  const validateShift = (userId, shiftTypeId) => {
+  // בדיקה מרכזית של פטורים ואילוצים עבור חייל, טווח תאריכים וסוג תורנות
+  const validateShift = (userId, shiftTypeId, startDate = formData.startDate, endDate = formData.endDate, isWeekendFlag = formData.isWeekend) => {
+    if (!userId || !startDate || !endDate) return true;
+
     const selectedUser = users.find(u => String(u.id) === String(userId));
+    if (!selectedUser) return true;
+
     const selectedType = shiftTypes.find(t => String(t.id) === String(shiftTypeId));
+    const sStart = new Date(`${startDate.split('T')[0]}T00:00:00`);
+    const sEnd = new Date(`${endDate.split('T')[0]}T23:59:59`);
 
-    if (!selectedUser || !selectedType) return true;
+    // 1. בדיקת תאריך שחרור
+    if (selectedUser.release_date) {
+      const releaseDate = new Date(`${selectedUser.release_date.split('T')[0]}T00:00:00`);
+      if (sEnd > releaseDate) {
+        return `החייל ${selectedUser.full_name} משתחרר בתאריך ${formatDateHe(selectedUser.release_date)}!`;
+      }
+    }
+    // 2. בדיקת אילוצים (חייל ספציפי, גף, או כלל הטייסת)
+    const conflictingConstraint = constraints.find(c => {
+      const cStart = new Date(`${c.originalStart.split('T')[0]}T00:00:00`);
+      const cEnd = new Date(`${c.originalEnd.split('T')[0]}T23:59:59`);
+      const isOverlapping = sStart <= cEnd && sEnd >= cStart;
+      if (!isOverlapping) return false;
 
-    const userExemptions = selectedUser.exemptionIds || [];
-    if (userExemptions.includes(1) && selectedType.name.includes('מטבח')) return "לחייל זה יש פטור מטבח!";
-    if (userExemptions.includes(2) && selectedType.name.includes('שמירה')) return "לחייל זה יש פטור שמירות!";
-    if (userExemptions.includes(3) && selectedType.name.includes('רס"ר')) return "לחייל זה יש פטור רס\"ר!";
-    if (userExemptions.includes(4) && formData.isWeekend) return "לחייל זה יש פטור שבתות!";
+      // אילוץ של החייל עצמו
+      if (c.userId && String(c.userId) === String(selectedUser.id)) return true;
+
+      // אילוץ של הגף של החייל
+      if (
+        c.division &&
+        c.division !== 'לא מוגדר' &&
+        c.division.trim() !== '' &&
+        selectedUser.division &&
+        c.division.trim() === selectedUser.division.trim()
+      ) {
+        return true;
+      }
+
+      // אילוץ טייסתי כללי (ללא חייל וללא גף)
+      if (!c.userId && (!c.division || c.division === 'לא מוגדר' || c.division.trim() === '')) {
+        return true;
+      }
+
+      return false;
+    });
+
+    if (conflictingConstraint) {
+      return `קיים אילוץ בתאריכים אלו (${conflictingConstraint.title})!`;
+    }
+
+    // 3. חילוץ שמות ומזהי הפטורים של החייל (תומך גם ב-String וגם ב-Number)
+    const rawExemptions = selectedUser.exemptionIds || [];
+    const userExemptionIdsStr = rawExemptions.map(id => String(id));
+    const userExemptionNames = rawExemptions.map(id => {
+      const found = exemptionTypes.find(e => String(e.id) === String(id));
+      return found ? found.name : String(id);
+    });
+
+    const hasExemption = (idNum, keyword) =>
+      userExemptionIdsStr.includes(String(idNum)) ||
+      userExemptionNames.some(name => name.includes(keyword));
+
+    // 4. בדיקת פטור שבתות
+    const isShabbatInRange = isWeekendFlag || doesRangeContainShabbat(startDate, endDate);
+    if (isShabbatInRange && hasExemption(4, 'שבת')) {
+      return `ל-${selectedUser.full_name} יש פטור שבתות!`;
+    }
+
+    // 5. בדיקות תלויות סוג תורנות (מטבח, שמירות, רס"ר, מגדר)
+    if (selectedType) {
+      const typeName = selectedType.name || '';
+
+      if (typeName.includes('מטבח') && hasExemption(1, 'מטבח')) {
+        return `ל-${selectedUser.full_name} יש פטור מטבח!`;
+      }
+      if (typeName.includes('שמיר') && hasExemption(2, 'שמיר')) {
+        return `ל-${selectedUser.full_name} יש פטור שמירות!`;
+      }
+      if ((typeName.includes('רס"ר') || typeName.includes('רסר')) && (hasExemption(3, 'רס"ר') || hasExemption(3, 'רסר'))) {
+        return `ל-${selectedUser.full_name} יש פטור רס"ר!`;
+      }
+
+      if (
+        selectedType.gender_limit &&
+        selectedType.gender_limit !== 'all' &&
+        selectedUser.gender &&
+        selectedType.gender_limit !== selectedUser.gender
+      ) {
+        return `תורנות זו מוגדרת עבור ${selectedType.gender_limit === 'male' ? 'בנים בלבד' : 'בנות בלבד'}!`;
+      }
+    }
 
     return true;
   };
@@ -807,7 +885,7 @@ function App() {
     }
 
     const shiftType = shiftTypes.find(t => String(t.id) === String(formData.shiftTypeId));
-    const isGuardShift = shiftType && shiftType.name.includes('שמירות');
+    const isGuardShift = shiftType && shiftType.name.includes('שמיר');
 
     const timeToSplit = isGuardShift ? '14:00:00' : '00:00:00';
     const splitPoint = new Date(`${splitDate}T${timeToSplit}`);
@@ -910,15 +988,28 @@ function App() {
     setIsDuplicateModalOpen(true);
   };
 
-  const handleSaveDuplicate = () => {
+const handleSaveDuplicate = () => {
     if (!duplicateFormData.startDate || !duplicateFormData.endDate || !duplicateFormData.userId) {
       alert('חובה למלא תאריכים וחייל!');
       return;
     }
 
+    const isWeekendDup = doesRangeContainShabbat(duplicateFormData.startDate, duplicateFormData.endDate);
+    const validationResult = validateShift(
+      duplicateFormData.userId,
+      shiftToDuplicate.shiftTypeId,
+      duplicateFormData.startDate,
+      duplicateFormData.endDate,
+      isWeekendDup
+    );
+
+    if (validationResult !== true) {
+      alert(`⚠️ שיבוץ לא תקין: ${validationResult}`);
+      return;
+    }
+
     const isWithinWeek = checkIsDateWithinWeek(duplicateFormData.startDate);
     const finalBaltam = isWithinWeek ? true : shiftToDuplicate.isBaltam;
-    const isWeekendDup = doesRangeContainShabbat(duplicateFormData.startDate, duplicateFormData.endDate);
 
     fetch(`${API_BASE}/api/shifts`, {
       method: 'POST',
@@ -1049,6 +1140,28 @@ function App() {
   };
 
   const eventStyleGetter = (event) => {
+    // 0. עיצוב הקו המחבר בין תאריך התחלה לסיום על גבי לוח השנה עצמו
+    if (event.type === 'selection-line') {
+      return {
+        style: {
+          backgroundColor: theme.darkgreen,
+          color: theme.backgroundcolor,
+          border: `2px solid ${theme.pink}`,
+          borderRadius: '20px',
+          height: '22px',
+          fontSize: '12px',
+          fontWeight: 'bold',
+          textAlign: 'center',
+          display: 'flex',
+          justifyContent: 'center',
+          alignItems: 'center',
+          boxShadow: '0 0 10px rgba(40, 89, 60, 0.7)',
+          zIndex: 50,
+          pointerEvents: 'none'
+        }
+      };
+    }
+
     let finalColor = '#3174ad';
 
     if (event.type === 'constraint') {
@@ -1081,9 +1194,16 @@ function App() {
         opacity: currentOpacity,
         border: currentBorder,
         filter: currentFilter,
-        borderRadius: '5px',
+        borderRadius: '8px',
         color: 'white',
-        transition: 'all 0.3s ease'
+        transition: 'all 0.3s ease',
+        // מרכוז הכיתוב באמצע הפס של התורנות:
+        textAlign: 'center',
+        display: 'flex',
+        justifyContent: 'center',
+        alignItems: 'center',
+        fontWeight: 'bold',
+        padding: '2px 6px'
       }
     };
   };
@@ -1174,6 +1294,35 @@ function App() {
         exemptionData: e
       };
     }).filter(e => e !== null)
+    // קו מחבר חי על גבי לוח השנה עצמו בזמן בחירת תאריך התחלה וסיום
+    , ...(() => {
+      const activeStart =
+        selectedSlotDates?.startDate ||
+        (isModalOpen ? formData.startDate : null) ||
+        (isConstraintModalOpen ? constraintFormData.startDate : null) ||
+        (isPublishModalOpen ? publishFormData.startDate : null) ||
+        (isUnpublishModalOpen ? unpublishFormData.startDate : null) ||
+        (isDuplicateModalOpen ? duplicateFormData.startDate : null);
+
+      const activeEnd =
+        selectedSlotDates?.endDate ||
+        (isModalOpen ? formData.endDate : null) ||
+        (isConstraintModalOpen ? constraintFormData.endDate : null) ||
+        (isPublishModalOpen ? publishFormData.endDate : null) ||
+        (isUnpublishModalOpen ? unpublishFormData.endDate : null) ||
+        (isDuplicateModalOpen ? duplicateFormData.endDate : null);
+
+      if (!activeStart || !activeEnd) return [];
+
+      return [{
+        id: 'selection-connector-line',
+        title: `●━━━━━━ ${formatDateHe(activeStart)} עד ${formatDateHe(activeEnd)} ━━━━━━●`,
+        start: new Date(`${activeStart.split('T')[0]}T00:00:00`),
+        end: new Date(`${activeEnd.split('T')[0]}T23:59:59`),
+        allDay: true,
+        type: 'selection-line'
+      }];
+    })()
   ];
 
   const getWeeklySummaryData = () => {
@@ -1647,7 +1796,38 @@ function App() {
 
     const compareDate = new Date(date);
     compareDate.setHours(0, 0, 0, 0);
+    const dateStr = format(compareDate, 'yyyy-MM-dd');
 
+    // בדיקה האם יש טווח תאריכים שנבחר כרגע (בחלון בחירה, שיבוץ או אילוץ)
+    const activeStart =
+      selectedSlotDates?.startDate ||
+      (isModalOpen ? formData.startDate : null) ||
+      (isConstraintModalOpen ? constraintFormData.startDate : null);
+
+    const activeEnd =
+      selectedSlotDates?.endDate ||
+      (isModalOpen ? formData.endDate : null) ||
+      (isConstraintModalOpen ? constraintFormData.endDate : null);
+
+    // אם היום הזה נמצא בתוך טווח ההתחלה והסיום שנבחר - נצייר קו מחבר רציף בין הימים!
+    if (activeStart && activeEnd && dateStr >= activeStart && dateStr <= activeEnd) {
+      const isStart = dateStr === activeStart;
+      const isEnd = dateStr === activeEnd;
+
+      return {
+        style: {
+          backgroundColor: 'rgba(232, 176, 189, 0.45)', // רקע ורדרד עדין לטווח הנבחר
+          backgroundImage: `linear-gradient(to bottom, transparent 46%, ${theme.darkgreen} 46%, ${theme.darkgreen} 54%, transparent 54%)`, // קו אמצעי מחבר בין הימים
+          borderTop: `2px solid ${theme.darkgreen}`,
+          borderBottom: `2px solid ${theme.darkgreen}`,
+          borderRight: isStart ? `3px solid ${theme.darkgreen}` : 'none', // התחלה בימין (RTL)
+          borderLeft: isEnd ? `3px solid ${theme.darkgreen}` : 'none',    // סיום בשמאל (RTL)
+          fontWeight: 'bold'
+        }
+      };
+    }
+
+    // 1. האם זה היום?
     if (compareDate.getTime() === now.getTime()) {
       return {
         style: {
@@ -1657,6 +1837,7 @@ function App() {
       };
     }
 
+    // 2. האם זה יום שעבר?
     if (compareDate < now) {
       return {
         style: {
@@ -2820,8 +3001,8 @@ function App() {
 
       {/* חלון שיבוץ / עריכת תורנות */}
       {isModalOpen && (
-        <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(58, 33, 25, 0.6)', zIndex: 2000, display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
-          <div style={{ background: theme.backgroundcolor, padding: '30px', borderRadius: '10px', width: '400px', position: 'relative', color: theme.darkgreen }}>
+        <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(58, 33, 25, 0.15)', zIndex: 2000, display: 'flex', justifyContent: 'center', alignItems: 'center' }}>
+          <div style={{ background: theme.backgroundcolor, padding: '30px', borderRadius: '10px', width: '400px', position: 'relative', color: theme.darkgreen, border: `2px solid ${theme.darkgreen}`, boxShadow: '0 10px 30px rgba(0,0,0,0.3)' }}>
             <button onClick={() => setIsModalOpen(false)} style={{ position: 'absolute', top: '10px', left: '10px', background: 'transparent', border: 'none', fontSize: '20px', cursor: 'pointer', color: theme.darkgreen }}>✖</button>
             <h2 style={{ marginTop: 0, paddingBottom: '10px', color: theme.darkgreen }}>{editingShiftId ? 'עריכת תורנות' : 'שיבוץ תורנות חדשה'}</h2>
 
@@ -2854,345 +3035,350 @@ function App() {
                   }}
                   style={{ width: '100%', padding: '6px', boxSizing: 'border-box', borderRadius: "15px", backgroundColor: theme.backgroundcolor, border: `1px solid ${theme.darkgreen}`, color: theme.darkgreen }}
                 />
-              </div>
+            </div>
 
-              <div>
-                <label>בחר חייל:</label>
-                <select
-                  value={formData.userId}
-                  onChange={(e) => {
-                    const newUserId = e.target.value;
-                    setFormData({ ...formData, userId: newUserId });
-                    checkConflict(newUserId, formData.startDate, formData.endDate, formData.shiftTypeId);
-                  }}
-                  style={{ width: '100%', padding: '6px', boxSizing: 'border-box', borderRadius: "15px", backgroundColor: theme.backgroundcolor, border: `1px solid ${theme.darkgreen}`, color: theme.darkgreen }}
-                >
-                  <option value="">בחר חייל</option>
-                  {getAvailableSoldiers().map(u => (
-                    <option key={u.id} value={u.id}>{u.full_name}</option>
-                  ))}
-                </select>
-              </div>
+            <div>
+              <label>בחר חייל:</label>
+              <select
+                value={formData.userId}
+                onChange={(e) => {
+                  const newUserId = e.target.value;
+                  setFormData({ ...formData, userId: newUserId });
+                  checkConflict(newUserId, formData.startDate, formData.endDate, formData.shiftTypeId);
+                }}
+                style={{ width: '100%', padding: '6px', boxSizing: 'border-box', borderRadius: "15px", backgroundColor: theme.backgroundcolor, border: `1px solid ${theme.darkgreen}`, color: theme.darkgreen }}
+              >
+                <option value="">בחר חייל</option>
+                {getAvailableSoldiers().map(u => (
+                  <option key={u.id} value={u.id}>{u.full_name}</option>
+                ))}
+              </select>
+            </div>
 
-              <div>
-                <label>סוג תורנות:</label>
-                <select
-                  value={formData.shiftTypeId}
-                  onChange={(e) => {
-                    const newTypeId = e.target.value;
-                    setFormData({ ...formData, shiftTypeId: newTypeId });
-                    checkConflict(formData.userId, formData.startDate, formData.endDate, newTypeId);
-                  }}
-                  style={{ width: '100%', padding: '6px', boxSizing: 'border-box', borderRadius: "15px", backgroundColor: theme.backgroundcolor, border: `1px solid ${theme.darkgreen}`, color: theme.darkgreen }}
-                >
-                  <option value="">בחר סוג תורנות</option>
-                  {shiftTypes.map(t => (<option key={t.id} value={t.id}>{t.name}</option>))}
-                </select>
-              </div>
+            <div>
+              <label>סוג תורנות:</label>
+              <select
+                value={formData.shiftTypeId}
+                onChange={(e) => {
+                  const newTypeId = e.target.value;
+                  setFormData({ ...formData, shiftTypeId: newTypeId });
+                  checkConflict(formData.userId, formData.startDate, formData.endDate, newTypeId);
+                }}
+                style={{ width: '100%', padding: '6px', boxSizing: 'border-box', borderRadius: "15px", backgroundColor: theme.backgroundcolor, border: `1px solid ${theme.darkgreen}`, color: theme.darkgreen }}
+              >
+                <option value="">בחר סוג תורנות</option>
+                {shiftTypes.map(t => (<option key={t.id} value={t.id}>{t.name}</option>))}
+              </select>
+            </div>
 
-              <div>
-                <label style={{ display: 'block', marginBottom: '5px' }}>הערות:</label>
-                <textarea
-                  value={formData.notes}
-                  onChange={(e) => setFormData({ ...formData, notes: e.target.value })}
-                  style={{
-                    width: '100%',
-                    padding: '8px',
-                    boxSizing: 'border-box',
-                    borderRadius: "15px",
-                    backgroundColor: theme.backgroundcolor,
-                    border: `1.5px solid ${theme.darkgreen}`,
-                    color: theme.darkgreen,
-                    minHeight: '80px',
-                    resize: 'vertical'
-                  }}
-                  placeholder="הוסיפי הערה לתורנות..."
-                />
-              </div>
+            <div>
+              <label style={{ display: 'block', marginBottom: '5px' }}>הערות:</label>
+              <textarea
+                value={formData.notes}
+                onChange={(e) => setFormData({ ...formData, notes: e.target.value })}
+                style={{
+                  width: '100%',
+                  padding: '8px',
+                  boxSizing: 'border-box',
+                  borderRadius: "15px",
+                  backgroundColor: theme.backgroundcolor,
+                  border: `1.5px solid ${theme.darkgreen}`,
+                  color: theme.darkgreen,
+                  minHeight: '80px',
+                  resize: 'vertical'
+                }}
+                placeholder="הוסיפי הערה לתורנות..."
+              />
+            </div>
 
-              <div style={{ display: 'flex', gap: '20px', marginTop: '5px' }}>
+            <div style={{ display: 'flex', gap: '20px', marginTop: '5px' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '5px', cursor: 'pointer', fontWeight: 'bold' }}>
+                <input type="checkbox" checked={formData.isWeekend} onChange={(e) => setFormData({ ...formData, isWeekend: e.target.checked })} /> שבת
+              </label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '5px', cursor: 'pointer', fontWeight: 'bold' }}>
+                <input type="checkbox" checked={displayBaltam} disabled={forcedBaltam} onChange={(e) => setFormData({ ...formData, isBaltam: e.target.checked })} /> בלת"ם
+              </label>
+              {editingShiftId && (
                 <label style={{ display: 'flex', alignItems: 'center', gap: '5px', cursor: 'pointer', fontWeight: 'bold' }}>
-                  <input type="checkbox" checked={formData.isWeekend} onChange={(e) => setFormData({ ...formData, isWeekend: e.target.checked })} /> שבת
-                </label>
-                <label style={{ display: 'flex', alignItems: 'center', gap: '5px', cursor: 'pointer', fontWeight: 'bold' }}>
-                  <input type="checkbox" checked={displayBaltam} disabled={forcedBaltam} onChange={(e) => setFormData({ ...formData, isBaltam: e.target.checked })} /> בלת"ם
-                </label>
-                {editingShiftId && (
-                  <label style={{ display: 'flex', alignItems: 'center', gap: '5px', cursor: 'pointer', fontWeight: 'bold' }}>
-                    <input
-                      type="checkbox"
-                      checked={hasReplacement}
-                      onChange={async (e) => {
-                        const isChecked = e.target.checked;
+                  <input
+                    type="checkbox"
+                    checked={hasReplacement}
+                    onChange={async (e) => {
+                      const isChecked = e.target.checked;
 
-                        if (!isChecked) {
-                          const cleanShiftId = editingShiftId ? String(editingShiftId).split('-')[0] : null;
-                          const currentExemption = shiftExemptions.find(ex => String(ex.shift_id) === cleanShiftId) || (replacementData.id ? replacementData : null);
+                      if (!isChecked) {
+                        const cleanShiftId = editingShiftId ? String(editingShiftId).split('-')[0] : null;
+                        const currentExemption = shiftExemptions.find(ex => String(ex.shift_id) === cleanShiftId) || (replacementData.id ? replacementData : null);
 
-                          if (currentExemption && currentExemption.id) {
-                            try {
-                              await fetch(`${API_BASE}/api/shift-exemptions/${currentExemption.id}`, { method: 'DELETE' });
-                            } catch (err) {
-                              console.error("שגיאה במחיקת החלפה:", err);
-                            }
+                        if (currentExemption && currentExemption.id) {
+                          try {
+                            await fetch(`${API_BASE}/api/shift-exemptions/${currentExemption.id}`, { method: 'DELETE' });
+                          } catch (err) {
+                            console.error("שגיאה במחיקת החלפה:", err);
                           }
-
-                          setHasReplacement(false);
-                          setReplacementData({ shift_id: '', start_date: '', end_date: '', type: 'pet' });
-                          setReplacementForm({ type: 'pet', startDate: '', endDate: '', startTime: '', endTime: '' });
-                          await fetchShiftExemptions();
-                          await fetchShifts();
-                        } else {
-                          setHasReplacement(true);
-                          setIsReplacementModalOpen(true);
                         }
-                      }}
-                    />
-                    הוסף החלפה
-                  </label>
-                )}
-              </div>
 
-              <div style={{ display: 'flex', gap: '10px', marginTop: '10px' }}>
-                <button onClick={handleSaveShift} style={{ flex: 1, padding: '12px', background: theme.pink, color: theme.darkgreen, border: 'none', borderRadius: '5px', cursor: 'pointer', fontWeight: 'bold', fontSize: '15px' }}>{editingShiftId ? 'עדכן' : 'שמור ושבץ'}</button>
-                {editingShiftId && <button onClick={handleDelete} style={{ flex: 1, padding: '12px', background: theme.pink, color: theme.darkgreen, border: 'none', borderRadius: '5px', cursor: 'pointer', fontWeight: 'bold', fontSize: '15px' }}>מחק</button>}
-                <button onClick={handleDuplicateClick} style={{ flex: 1, padding: '12px', background: theme.pink, color: theme.darkgreen, border: 'none', borderRadius: '5px', cursor: 'pointer', fontWeight: 'bold', fontSize: '15px' }}>
-                  שכפל
-                </button>
-                {editingShiftId && (
-                  <button onClick={() => setIsSplitModalOpen(true)} style={{ flex: 1, padding: '12px', background: theme.pink, color: theme.darkgreen, border: 'none', borderRadius: '5px', cursor: 'pointer', fontWeight: 'bold', fontSize: '15px' }}>
-                    פצל תורנות
-                  </button>
-                )}
-              </div>
-
-              {isSplitModalOpen && (
-                <div style={{ background: theme.darkgreen, padding: '15px', borderRadius: '8px', marginTop: '5px' }}>
-                  <h4 style={{ margin: '0 0 10px 0', color: theme.pink }}>פיצול תורנות</h4>
-                  <p style={{ fontSize: '12px', margin: '0 0 10px 0', color: theme.pink }}>בחר מאיזה תאריך להתחיל את החלק השני של התורנות (החלק המפוצל ייווצר כמשבצת ריקה ללא חייל):</p>
-                  <div style={{ display: 'flex', gap: '10px' }}>
-                    <input type="date" value={splitDate} onChange={(e) => setSplitDate(e.target.value)} min={formData.startDate} max={formData.endDate} style={{ flex: 1, padding: '8px', backgroundColor: theme.pink, color: theme.darkgreen, borderRadius: '6px' }} />
-                    <button onClick={handleSplitShift} style={{ flex: 1, padding: '8px', background: theme.pink, color: theme.darkgreen, border: 'none', borderRadius: '5px', cursor: 'pointer', fontWeight: 'bold', fontSize: '15px' }}>בצע חיתוך</button>
-                    <button onClick={() => setIsSplitModalOpen(false)} style={{ flex: 1, padding: '5px', background: theme.pink, color: theme.darkgreen, border: 'none', borderRadius: '5px', cursor: 'pointer', fontWeight: 'bold', fontSize: '15px' }}>ביטול</button>
-                  </div>
-                </div>
+                        setHasReplacement(false);
+                        setReplacementData({ shift_id: '', start_date: '', end_date: '', type: 'pet' });
+                        setReplacementForm({ type: 'pet', startDate: '', endDate: '', startTime: '', endTime: '' });
+                        await fetchShiftExemptions();
+                        await fetchShifts();
+                      } else {
+                        setHasReplacement(true);
+                        setIsReplacementModalOpen(true);
+                      }
+                    }}
+                  />
+                  הוסף החלפה
+                </label>
               )}
             </div>
+
+            <div style={{ display: 'flex', gap: '10px', marginTop: '10px' }}>
+              <button onClick={handleSaveShift} style={{ flex: 1, padding: '12px', background: theme.pink, color: theme.darkgreen, border: 'none', borderRadius: '5px', cursor: 'pointer', fontWeight: 'bold', fontSize: '15px' }}>{editingShiftId ? 'עדכן' : 'שמור ושבץ'}</button>
+              {editingShiftId && <button onClick={handleDelete} style={{ flex: 1, padding: '12px', background: theme.pink, color: theme.darkgreen, border: 'none', borderRadius: '5px', cursor: 'pointer', fontWeight: 'bold', fontSize: '15px' }}>מחק</button>}
+              <button onClick={handleDuplicateClick} style={{ flex: 1, padding: '12px', background: theme.pink, color: theme.darkgreen, border: 'none', borderRadius: '5px', cursor: 'pointer', fontWeight: 'bold', fontSize: '15px' }}>
+                שכפל
+              </button>
+              {editingShiftId && (
+                <button onClick={() => setIsSplitModalOpen(true)} style={{ flex: 1, padding: '12px', background: theme.pink, color: theme.darkgreen, border: 'none', borderRadius: '5px', cursor: 'pointer', fontWeight: 'bold', fontSize: '15px' }}>
+                  פצל תורנות
+                </button>
+              )}
+            </div>
+
+            {isSplitModalOpen && (
+              <div style={{ background: theme.darkgreen, padding: '15px', borderRadius: '8px', marginTop: '5px' }}>
+                <h4 style={{ margin: '0 0 10px 0', color: theme.pink }}>פיצול תורנות</h4>
+                <p style={{ fontSize: '12px', margin: '0 0 10px 0', color: theme.pink }}>בחר מאיזה תאריך להתחיל את החלק השני של התורנות (החלק המפוצל ייווצר כמשבצת ריקה ללא חייל):</p>
+                <div style={{ display: 'flex', gap: '10px' }}>
+                  <input type="date" value={splitDate} onChange={(e) => setSplitDate(e.target.value)} min={formData.startDate} max={formData.endDate} style={{ flex: 1, padding: '8px', backgroundColor: theme.pink, color: theme.darkgreen, borderRadius: '6px' }} />
+                  <button onClick={handleSplitShift} style={{ flex: 1, padding: '8px', background: theme.pink, color: theme.darkgreen, border: 'none', borderRadius: '5px', cursor: 'pointer', fontWeight: 'bold', fontSize: '15px' }}>בצע חיתוך</button>
+                  <button onClick={() => setIsSplitModalOpen(false)} style={{ flex: 1, padding: '5px', background: theme.pink, color: theme.darkgreen, border: 'none', borderRadius: '5px', cursor: 'pointer', fontWeight: 'bold', fontSize: '15px' }}>ביטול</button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
-      )}
+        </div>
+  )
+}
 
-      {/* חלון הוספת / עריכת החלפה (פט / טייסת) */}
-      {isReplacementModalOpen && (
-        <div style={{ position: "fixed", top: "0", left: "0", width: "100%", height: "100%", background: "rgba(0, 0, 0, 0.6)", display: "flex", justifyContent: "center", alignItems: "center", zIndex: 99999 }}>
-          <div style={{ background: theme.backgroundcolor, padding: "25px", borderRadius: "15px", width: "350px", display: "flex", flexDirection: "column", gap: "15px" }}>
-            <button onClick={() => {
-              setIsReplacementModalOpen(false);
-              if (!replacementData.id) setHasReplacement(false);
-              setReplacementForm({ type: 'pet', startDate: '', endDate: '', startTime: '', endTime: '' });
-            }} style={{ position: "relative", top: '-13px', right: '150px', background: 'transparent', border: 'none', fontSize: '20px', cursor: 'pointer', color: theme.darkgreen }}>✖</button>
+{/* חלון הוספת / עריכת החלפה (פט / טייסת) */ }
+{
+  isReplacementModalOpen && (
+    <div style={{ position: "fixed", top: "0", left: "0", width: "100%", height: "100%", background: "rgba(0, 0, 0, 0.6)", display: "flex", justifyContent: "center", alignItems: "center", zIndex: 99999 }}>
+      <div style={{ background: theme.backgroundcolor, padding: "25px", borderRadius: "15px", width: "350px", display: "flex", flexDirection: "column", gap: "15px" }}>
+        <button onClick={() => {
+          setIsReplacementModalOpen(false);
+          if (!replacementData.id) setHasReplacement(false);
+          setReplacementForm({ type: 'pet', startDate: '', endDate: '', startTime: '', endTime: '' });
+        }} style={{ position: "relative", top: '-13px', right: '150px', background: 'transparent', border: 'none', fontSize: '20px', cursor: 'pointer', color: theme.darkgreen }}>✖</button>
 
-            <h3 style={{ marginTop: "-20px" }}>פרטי החלפה</h3>
-            <label style={{ fontSize: '15px', display: 'block', marginTop: "-10px", marginBottom: '-5px', color: theme.darkgreen, textAlign: "right" }}>
-              בחירת סוג החלפה
-            </label>
-            <select
-              value={replacementForm.type || 'pet'}
-              onChange={(e) => setReplacementForm({ ...replacementForm, type: e.target.value })}
+        <h3 style={{ marginTop: "-20px" }}>פרטי החלפה</h3>
+        <label style={{ fontSize: '15px', display: 'block', marginTop: "-10px", marginBottom: '-5px', color: theme.darkgreen, textAlign: "right" }}>
+          בחירת סוג החלפה
+        </label>
+        <select
+          value={replacementForm.type || 'pet'}
+          onChange={(e) => setReplacementForm({ ...replacementForm, type: e.target.value })}
+          style={{ width: '100%', padding: '6px', boxSizing: 'border-box', borderRadius: "15px", backgroundColor: theme.backgroundcolor, border: `1px solid ${theme.darkgreen}`, color: theme.darkgreen }}
+        >
+          <option value="pet">החלפת פרח טיס (פט)</option>
+          <option value="squadron">החלפה עם טייסת אחרת</option>
+        </select>
+
+        <div style={{ display: 'flex', gap: '10px' }}>
+          <div style={{ flex: 1 }}>
+            <label style={{ fontSize: '15px', display: 'block', marginBottom: '2px', color: theme.darkgreen, textAlign: "right" }}>תאריך התחלה</label>
+            <input
+              type="date"
+              value={replacementForm.startDate}
+              min={shifts.find(s => String(s.id) === String(editingShiftId))?.originalStart?.split('T')[0]}
+              max={shifts.find(s => String(s.id) === String(editingShiftId))?.originalEnd?.split('T')[0]}
+              onChange={(e) => setReplacementForm({ ...replacementForm, startDate: e.target.value })}
               style={{ width: '100%', padding: '6px', boxSizing: 'border-box', borderRadius: "15px", backgroundColor: theme.backgroundcolor, border: `1px solid ${theme.darkgreen}`, color: theme.darkgreen }}
-            >
-              <option value="pet">החלפת פרח טיס (פט)</option>
-              <option value="squadron">החלפה עם טייסת אחרת</option>
-            </select>
-
-            <div style={{ display: 'flex', gap: '10px' }}>
-              <div style={{ flex: 1 }}>
-                <label style={{ fontSize: '15px', display: 'block', marginBottom: '2px', color: theme.darkgreen, textAlign: "right" }}>תאריך התחלה</label>
-                <input
-                  type="date"
-                  value={replacementForm.startDate}
-                  min={shifts.find(s => String(s.id) === String(editingShiftId))?.originalStart?.split('T')[0]}
-                  max={shifts.find(s => String(s.id) === String(editingShiftId))?.originalEnd?.split('T')[0]}
-                  onChange={(e) => setReplacementForm({ ...replacementForm, startDate: e.target.value })}
-                  style={{ width: '100%', padding: '6px', boxSizing: 'border-box', borderRadius: "15px", backgroundColor: theme.backgroundcolor, border: `1px solid ${theme.darkgreen}`, color: theme.darkgreen }}
-                />
-              </div>
-              <div style={{ flex: 1 }}>
-                <label style={{ fontSize: '15px', display: 'block', marginBottom: '2px', color: theme.darkgreen, textAlign: "right" }}>תאריך סיום</label>
-                <input
-                  type="date"
-                  value={replacementForm.endDate}
-                  min={shifts.find(s => String(s.id) === String(editingShiftId))?.originalStart?.split('T')[0]}
-                  max={shifts.find(s => String(s.id) === String(editingShiftId))?.originalEnd?.split('T')[0]}
-                  onChange={(e) => setReplacementForm({ ...replacementForm, endDate: e.target.value })}
-                  style={{ width: '100%', padding: '6px', boxSizing: 'border-box', borderRadius: "15px", backgroundColor: theme.backgroundcolor, border: `1px solid ${theme.darkgreen}`, color: theme.darkgreen }}
-                />
-              </div>
-            </div>
-
-            <div style={{ display: 'flex', gap: '10px' }}>
-              <div style={{ flex: 1 }}>
-                <label style={{ fontSize: '15px', display: 'block', marginBottom: '2px', color: theme.darkgreen, textAlign: "right" }}>שעת התחלה</label>
-                <input
-                  type="time"
-                  value={replacementForm.startTime || ''}
-                  onChange={(e) => handleTimeChange(e, 'startTime')}
-                  placeholder="שעה התחלה (רשות)"
-                  style={{ width: '100%', padding: '6px', boxSizing: 'border-box', borderRadius: "15px", backgroundColor: theme.backgroundcolor, border: `1px solid ${theme.darkgreen}`, color: theme.darkgreen }}
-                />
-              </div>
-              <div style={{ flex: 1 }}>
-                <label style={{ fontSize: '15px', display: 'block', marginBottom: '2px', color: theme.darkgreen, textAlign: "right" }}>שעת סיום</label>
-                <input
-                  type="time"
-                  value={replacementForm.endTime || ''}
-                  onChange={(e) => handleTimeChange(e, 'endTime')}
-                  placeholder="שעה סיום (רשות)"
-                  style={{ width: '100%', padding: '6px', boxSizing: 'border-box', borderRadius: "15px", backgroundColor: theme.backgroundcolor, border: `1px solid ${theme.darkgreen}`, color: theme.darkgreen }}
-                />
-              </div>
-            </div>
-
-            <button
-              onClick={async () => {
-                if (!replacementForm.startDate || !replacementForm.endDate) {
-                  alert("חובה לבחור תאריך התחלה וסיום");
-                  return;
-                }
-
-                const url = replacementData.id
-                  ? `${API_BASE}/api/shift-exemptions/${replacementData.id}`
-                  : `${API_BASE}/api/shift-exemptions`;
-
-                const method = replacementData.id ? 'PUT' : 'POST';
-
-                try {
-                  const response = await fetch(url, {
-                    method: method,
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                      shift_id: editingShiftId,
-                      start_date: replacementForm.startDate,
-                      end_date: replacementForm.endDate,
-                      type: replacementForm.type,
-                      start_time: replacementForm.startTime || null,
-                      end_time: replacementForm.endTime || null
-                    })
-                  });
-
-                  if (!response.ok) throw new Error("שגיאה בשמירת ההחלפה");
-
-                  alert(replacementData.id ? "ההחלפה עודכנה בהצלחה!" : "ההחלפה נוצרה בהצלחה!");
-
-                  setIsReplacementModalOpen(false);
-                  setReplacementForm({ type: 'pet', startDate: '', endDate: '', startTime: '', endTime: '' });
-                  setReplacementData({ shift_id: '', start_date: '', end_date: '', type: 'pet' });
-                  fetchShiftExemptions();
-                } catch (err) {
-                  console.error(err);
-                  alert("קרתה שגיאה, נסי שוב");
-                }
-              }}
-              style={{
-                flex: 1,
-                padding: '12px',
-                background: theme.pink,
-                color: theme.darkgreen,
-                marginTop: "10px",
-                border: 'none',
-                borderRadius: '5px',
-                cursor: 'pointer',
-                fontWeight: 'bold',
-                fontSize: '15px'
-              }}
-            >
-              {replacementData.id ? 'עדכן החלפה' : 'שמור החלפה'}
-            </button>
+            />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={{ fontSize: '15px', display: 'block', marginBottom: '2px', color: theme.darkgreen, textAlign: "right" }}>תאריך סיום</label>
+            <input
+              type="date"
+              value={replacementForm.endDate}
+              min={shifts.find(s => String(s.id) === String(editingShiftId))?.originalStart?.split('T')[0]}
+              max={shifts.find(s => String(s.id) === String(editingShiftId))?.originalEnd?.split('T')[0]}
+              onChange={(e) => setReplacementForm({ ...replacementForm, endDate: e.target.value })}
+              style={{ width: '100%', padding: '6px', boxSizing: 'border-box', borderRadius: "15px", backgroundColor: theme.backgroundcolor, border: `1px solid ${theme.darkgreen}`, color: theme.darkgreen }}
+            />
           </div>
         </div>
-      )}
 
-      {/* מסך דוח השוואה מפורט */}
-      {currentScreen === 'dashboard' && (
-        <div style={{ position: 'fixed', top: 0, left: 0, width: '100%', height: '100%', background: theme.backgroundcolor, zIndex: 9999, padding: '40px', overflowY: 'auto', direction: 'rtl', boxSizing: 'border-box' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <h1 style={{ color: theme.darkgreen, margin: 0 }}>טבלת השוואה - דוח מפורט</h1>
-            <button onClick={() => setCurrentScreen('calendar')} style={{ padding: '8px 16px', fontSize: "17px", background: theme.pink, color: theme.darkgreen, border: `1px solid ${theme.darkgreen}`, borderRadius: '8px', fontWeight: 'bold', cursor: 'pointer' }}>חזרה ללוח</button>
+        <div style={{ display: 'flex', gap: '10px' }}>
+          <div style={{ flex: 1 }}>
+            <label style={{ fontSize: '15px', display: 'block', marginBottom: '2px', color: theme.darkgreen, textAlign: "right" }}>שעת התחלה</label>
+            <input
+              type="time"
+              value={replacementForm.startTime || ''}
+              onChange={(e) => handleTimeChange(e, 'startTime')}
+              placeholder="שעה התחלה (רשות)"
+              style={{ width: '100%', padding: '6px', boxSizing: 'border-box', borderRadius: "15px", backgroundColor: theme.backgroundcolor, border: `1px solid ${theme.darkgreen}`, color: theme.darkgreen }}
+            />
           </div>
-
-          <div style={{ display: 'flex', alignItems: 'center', width: "220px", gap: '10px', padding: '15px 0', borderRadius: '12px', marginBottom: "10px" }}>
-            <label style={{ fontSize: '15px', fontWeight: 'bold', color: theme.darkgreen }}>תקופה:</label>
-            <select
-              value={displayedPeriodStr}
-              onChange={(e) => {
-                const selectedPeriodName = e.target.value;
-                const found = customPeriods.find(p => p.name === selectedPeriodName);
-                if (found && found.startDate) {
-                  setStatsDate(new Date(`${found.startDate}T00:00:00`));
-                } else {
-                  const [half, year] = selectedPeriodName.split('.');
-                  const month = half === '1' ? 0 : 6;
-                  setStatsDate(new Date(2000 + parseInt(year, 10), month, 1));
-                }
-              }}
-              style={{ padding: '6px 10px', borderRadius: '8px', border: `1px solid ${theme.darkgreen}`, backgroundColor: theme.backgroundcolor, color: theme.darkgreen, fontWeight: 'bold', cursor: 'pointer' }}
-            >
-              {customPeriods.map(period => (
-                <option key={period.name} value={period.name}>תקופה {period.name}</option>
-              ))}
-            </select>
+          <div style={{ flex: 1 }}>
+            <label style={{ fontSize: '15px', display: 'block', marginBottom: '2px', color: theme.darkgreen, textAlign: "right" }}>שעת סיום</label>
+            <input
+              type="time"
+              value={replacementForm.endTime || ''}
+              onChange={(e) => handleTimeChange(e, 'endTime')}
+              placeholder="שעה סיום (רשות)"
+              style={{ width: '100%', padding: '6px', boxSizing: 'border-box', borderRadius: "15px", backgroundColor: theme.backgroundcolor, border: `1px solid ${theme.darkgreen}`, color: theme.darkgreen }}
+            />
           </div>
-
-          <table style={{ width: '100%', borderCollapse: 'collapse', background: theme.backgroundcolor, border: `2px solid ${theme.darkgreen}`, borderRadius: "30px" }}>
-            <thead>
-              <tr style={{ background: theme.darkgreen, color: theme.backgroundcolor }}>
-                <th style={{ padding: '10px' }}>שם החייל</th>
-                <th style={{ padding: '10px' }}>נקודות נטו</th>
-                <th style={{ padding: '10px' }}>שבתות</th>
-                <th style={{ padding: '10px' }}>שוש</th>
-                <th style={{ padding: '10px' }}>מקוצרת</th>
-                <th style={{ padding: '10px' }}>בלת"מים</th>
-                {shiftTypes.map(type => (
-                  <th key={type.id} style={{ padding: '10px' }}>{type.name}</th>
-                ))}
-                <th style={{ padding: '10px' }}>פירוט חגים</th>
-              </tr>
-            </thead>
-            <tbody>
-              {users.filter(u => u.is_active === 1 && (u.does_shifts === 1 || u.does_shifts === null)).map(user => {
-                const userStats = getNetStats(user.id, displayedPeriodShifts, shiftTypes);
-                const userShifts = displayedPeriodShifts.filter(s => String(s.userId) === String(user.id));
-                const balatamsCount = userShifts.filter(s => s.isBaltam).length;
-
-                return (
-                  <tr key={user.id} style={{ borderBottom: `2px solid ${theme.darkgreen}`, textAlign: 'center' }}>
-                    <td style={{ padding: '10px', border: `1px solid ${theme.darkgreen}` }}>{user.full_name}</td>
-                    <td style={{ padding: '10px', fontWeight: 'bold', border: `1px solid ${theme.darkgreen}` }}>{userStats.netPoints}</td>
-                    <td style={{ padding: '10px', border: `1px solid ${theme.darkgreen}` }}>{userStats.netShabbats}</td>
-                    <td style={{ padding: '10px', border: `1px solid ${theme.darkgreen}` }}>{userStats.shosh}</td>
-                    <td style={{ padding: '10px', border: `1px solid ${theme.darkgreen}` }}>{userStats.mkutzarot}</td>
-                    <td style={{ padding: '10px', color: theme.darkgreen, border: `1px solid ${theme.darkgreen}` }}>{balatamsCount}</td>
-
-                    {shiftTypes.map(type => {
-                      const count = userShifts.filter(s => String(s.shiftTypeId) === String(type.id)).length;
-                      return <td key={type.id} style={{ padding: '10px', border: `1px solid ${theme.darkgreen}` }}>{count}</td>;
-                    })}
-
-                    <td style={{ padding: '10px', fontSize: '15px', border: `1px solid ${theme.darkgreen}` }}>
-                      {(() => {
-                        const holidays = userShifts.filter(s => s.isHoliday && s.holidayName).map(s => s.holidayName);
-                        const uniqueHolidays = [...new Set(holidays)];
-                        return uniqueHolidays.length > 0 ? uniqueHolidays.join(', ') : 'אין';
-                      })()}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
         </div>
-      )}
+
+        <button
+          onClick={async () => {
+            if (!replacementForm.startDate || !replacementForm.endDate) {
+              alert("חובה לבחור תאריך התחלה וסיום");
+              return;
+            }
+
+            const url = replacementData.id
+              ? `${API_BASE}/api/shift-exemptions/${replacementData.id}`
+              : `${API_BASE}/api/shift-exemptions`;
+
+            const method = replacementData.id ? 'PUT' : 'POST';
+
+            try {
+              const response = await fetch(url, {
+                method: method,
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  shift_id: editingShiftId,
+                  start_date: replacementForm.startDate,
+                  end_date: replacementForm.endDate,
+                  type: replacementForm.type,
+                  start_time: replacementForm.startTime || null,
+                  end_time: replacementForm.endTime || null
+                })
+              });
+
+              if (!response.ok) throw new Error("שגיאה בשמירת ההחלפה");
+
+              alert(replacementData.id ? "ההחלפה עודכנה בהצלחה!" : "ההחלפה נוצרה בהצלחה!");
+
+              setIsReplacementModalOpen(false);
+              setReplacementForm({ type: 'pet', startDate: '', endDate: '', startTime: '', endTime: '' });
+              setReplacementData({ shift_id: '', start_date: '', end_date: '', type: 'pet' });
+              fetchShiftExemptions();
+            } catch (err) {
+              console.error(err);
+              alert("קרתה שגיאה, נסי שוב");
+            }
+          }}
+          style={{
+            flex: 1,
+            padding: '12px',
+            background: theme.pink,
+            color: theme.darkgreen,
+            marginTop: "10px",
+            border: 'none',
+            borderRadius: '5px',
+            cursor: 'pointer',
+            fontWeight: 'bold',
+            fontSize: '15px'
+          }}
+        >
+          {replacementData.id ? 'עדכן החלפה' : 'שמור החלפה'}
+        </button>
+      </div>
     </div>
+  )
+}
+
+{/* מסך דוח השוואה מפורט */ }
+{
+  currentScreen === 'dashboard' && (
+    <div style={{ position: 'fixed', top: 0, left: 0, width: '100%', height: '100%', background: theme.backgroundcolor, zIndex: 9999, padding: '40px', overflowY: 'auto', direction: 'rtl', boxSizing: 'border-box' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <h1 style={{ color: theme.darkgreen, margin: 0 }}>טבלת השוואה - דוח מפורט</h1>
+        <button onClick={() => setCurrentScreen('calendar')} style={{ padding: '8px 16px', fontSize: "17px", background: theme.pink, color: theme.darkgreen, border: `1px solid ${theme.darkgreen}`, borderRadius: '8px', fontWeight: 'bold', cursor: 'pointer' }}>חזרה ללוח</button>
+      </div>
+
+      <div style={{ display: 'flex', alignItems: 'center', width: "220px", gap: '10px', padding: '15px 0', borderRadius: '12px', marginBottom: "10px" }}>
+        <label style={{ fontSize: '15px', fontWeight: 'bold', color: theme.darkgreen }}>תקופה:</label>
+        <select
+          value={displayedPeriodStr}
+          onChange={(e) => {
+            const selectedPeriodName = e.target.value;
+            const found = customPeriods.find(p => p.name === selectedPeriodName);
+            if (found && found.startDate) {
+              setStatsDate(new Date(`${found.startDate}T00:00:00`));
+            } else {
+              const [half, year] = selectedPeriodName.split('.');
+              const month = half === '1' ? 0 : 6;
+              setStatsDate(new Date(2000 + parseInt(year, 10), month, 1));
+            }
+          }}
+          style={{ padding: '6px 10px', borderRadius: '8px', border: `1px solid ${theme.darkgreen}`, backgroundColor: theme.backgroundcolor, color: theme.darkgreen, fontWeight: 'bold', cursor: 'pointer' }}
+        >
+          {customPeriods.map(period => (
+            <option key={period.name} value={period.name}>תקופה {period.name}</option>
+          ))}
+        </select>
+      </div>
+
+      <table style={{ width: '100%', borderCollapse: 'collapse', background: theme.backgroundcolor, border: `2px solid ${theme.darkgreen}`, borderRadius: "30px" }}>
+        <thead>
+          <tr style={{ background: theme.darkgreen, color: theme.backgroundcolor }}>
+            <th style={{ padding: '10px' }}>שם החייל</th>
+            <th style={{ padding: '10px' }}>נקודות נטו</th>
+            <th style={{ padding: '10px' }}>שבתות</th>
+            <th style={{ padding: '10px' }}>שוש</th>
+            <th style={{ padding: '10px' }}>מקוצרת</th>
+            <th style={{ padding: '10px' }}>בלת"מים</th>
+            {shiftTypes.map(type => (
+              <th key={type.id} style={{ padding: '10px' }}>{type.name}</th>
+            ))}
+            <th style={{ padding: '10px' }}>פירוט חגים</th>
+          </tr>
+        </thead>
+        <tbody>
+          {users.filter(u => u.is_active === 1 && (u.does_shifts === 1 || u.does_shifts === null)).map(user => {
+            const userStats = getNetStats(user.id, displayedPeriodShifts, shiftTypes);
+            const userShifts = displayedPeriodShifts.filter(s => String(s.userId) === String(user.id));
+            const balatamsCount = userShifts.filter(s => s.isBaltam).length;
+
+            return (
+              <tr key={user.id} style={{ borderBottom: `2px solid ${theme.darkgreen}`, textAlign: 'center' }}>
+                <td style={{ padding: '10px', border: `1px solid ${theme.darkgreen}` }}>{user.full_name}</td>
+                <td style={{ padding: '10px', fontWeight: 'bold', border: `1px solid ${theme.darkgreen}` }}>{userStats.netPoints}</td>
+                <td style={{ padding: '10px', border: `1px solid ${theme.darkgreen}` }}>{userStats.netShabbats}</td>
+                <td style={{ padding: '10px', border: `1px solid ${theme.darkgreen}` }}>{userStats.shosh}</td>
+                <td style={{ padding: '10px', border: `1px solid ${theme.darkgreen}` }}>{userStats.mkutzarot}</td>
+                <td style={{ padding: '10px', color: theme.darkgreen, border: `1px solid ${theme.darkgreen}` }}>{balatamsCount}</td>
+
+                {shiftTypes.map(type => {
+                  const count = userShifts.filter(s => String(s.shiftTypeId) === String(type.id)).length;
+                  return <td key={type.id} style={{ padding: '10px', border: `1px solid ${theme.darkgreen}` }}>{count}</td>;
+                })}
+
+                <td style={{ padding: '10px', fontSize: '15px', border: `1px solid ${theme.darkgreen}` }}>
+                  {(() => {
+                    const holidays = userShifts.filter(s => s.isHoliday && s.holidayName).map(s => s.holidayName);
+                    const uniqueHolidays = [...new Set(holidays)];
+                    return uniqueHolidays.length > 0 ? uniqueHolidays.join(', ') : 'אין';
+                  })()}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+    </div >
   );
 }
 

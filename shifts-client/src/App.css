@@ -215,11 +215,36 @@
 }
 
 /* === העיצוב המרוכך של הלוח === */
-.rbc-header { 
-  padding: 10px; 
-  font-weight: bold; 
-  background: #F8F2E4; 
-  border-bottom: 2px solid #4D6B4F !important; 
+.rbc-header {
+  text-align: center !important;
+  display: flex !important;
+  justify-content: center !important;
+  align-items: center !important;
+  font-weight: bold !important;
+}
+
+.rbc-event,
+.rbc-event-content {
+  text-align: center !important;
+  display: flex !important;
+  justify-content: center !important;
+  align-items: center !important;
+  width: 100% !important;
+}
+
+/* עיצוב קו מחבר כאשר גוררים/בוחרים מספר ימים בלוח השנה */
+.rbc-slot-selection,
+.rbc-selected-cell {
+  background-color: rgba(232, 176, 189, 0.5) !important;
+  background-image: linear-gradient(
+    to bottom,
+    transparent 45%,
+    #28593C 45%,
+    #28593C 55%,
+    transparent 55%
+  ) !important;
+  border-top: 2px solid #28593C !important;
+  border-bottom: 2px solid #28593C !important;
 }
 
 .rbc-month-view { 
