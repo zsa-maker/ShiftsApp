@@ -6,7 +6,8 @@
   "scripts": {
     "build": "cd shifts-client && npm install && npm run build",
     "start": "node server.js",
-    "deploy-ready": "npm install && npm run build && node server.js"
+    "deploy-ready": "npm install && npm run build && node server.js",
+    "snow": "cd shifts-client && npm run build && cd .. && firebase deploy --only hosting"
   },
   "keywords": [],
   "author": "",
