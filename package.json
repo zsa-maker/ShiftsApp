@@ -1,26 +1,30 @@
 {
   "name": "shift-server",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "מערכת תורנויות — שרת API (Express + Firebase Admin)",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "cd shifts-client && npm install && npm run build",
     "start": "node server.js",
-    "deploy-ready": "npm install && npm run build && node server.js"
+    "dev": "node --watch server.js",
+    "test": "node --test test/*.test.js",
+    "deploy-ready": "npm install && npm run build && node server.js",
+    "deploy-rules": "firebase deploy --only firestore:rules"
   },
-  "keywords": [],
-  "author": "",
   "license": "ISC",
   "dependencies": {
     "bcrypt": "^6.0.0",
     "cors": "^2.8.6",
-    "date-fns": "^4.3.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "express-rate-limit": "^8.0.0",
     "firebase-admin": "^14.5.1",
     "googleapis": "^174.0.1",
-    "react-big-calendar": "^1.19.4",
-    "react-draggable": "^4.5.0",
-    "sqlite3": "^6.0.1"
+    "jsonwebtoken": "^9.0.2"
   }
 }

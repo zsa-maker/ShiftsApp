@@ -26,3 +26,11 @@ dist-ssr
 .serviceAccountKey.json
 serviceAccountKey.json
 *.serviceAccountKey.json
+# סודות ונתונים מקומיים — לעולם לא ב-git
+.env
+.env.*
+!.env.example
+shifts.db
+shifts.db-*
+*.db
+.firebase/

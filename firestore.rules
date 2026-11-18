@@ -1,0 +1,12 @@
+rules_version = '2';
+
+// כל הגישה לנתונים עוברת דרך השרת (Firebase Admin SDK עוקף את החוקים האלה).
+// הדפדפן לא מדבר עם Firestore ישירות, ולכן חוסמים כל גישה מבחוץ —
+// גם מי שמחזיק את ה-apiKey של הפרויקט לא יכול לקרוא או לכתוב כלום.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

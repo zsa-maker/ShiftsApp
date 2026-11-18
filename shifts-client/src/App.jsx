@@ -1,17 +1,17 @@
-import { useState, useRef, useEffect, useMemo } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import Draggable from 'react-draggable';
 import { Calendar, dateFnsLocalizer } from 'react-big-calendar';
 import { format, parse, startOfWeek, getDay } from 'date-fns';
-import he from 'date-fns/locale/he';
+import { he } from 'date-fns/locale';
 import 'react-big-calendar/lib/css/react-big-calendar.css';
 import './App.css';
 import { FiPlus, FiUpload, FiSettings, FiEye, FiEyeOff } from 'react-icons/fi';
-
-// זיהוי אוטומטי של כתובת השרת: עובד גם ב-Vite (פורט 5173) וגם מהטלפון/שרת מאוחד
-const API_BASE =
-  typeof window !== 'undefined' && window.location.port === '5173'
-    ? `http://${window.location.hostname}:3001`
-    : '';
+import { api, setSession, clearSession, getStoredUser } from './api.js';
+import { getHolidayNameForRange, prefetchHolidayYears } from './holidays.js';
+import {
+  checkEligibility, computeShiftPoints, computeUserStats, getPeriodName, potentialOf,
+  rangeContainsShabbat, cleanDate, todayInIsrael, addDays, isGuardType
+} from './shared/rules.js';
 
 const locales = { 'he': he };
 const localizer = dateFnsLocalizer({
@@ -24,64 +24,15 @@ const localizer = dateFnsLocalizer({
 
 const formatDateHe = (dateStr) => {
   if (!dateStr) return 'לא הוגדר';
-  const parts = dateStr.split('-');
+  const parts = String(dateStr).split('T')[0].split('-');
   if (parts.length === 3) return `${parts[2]}/${parts[1]}/${parts[0]}`;
   return dateStr;
 };
 
-// שליפת חגים דינאמית מ-Hebcal
-const fetchHebrewHolidayDynamic = async (startDateStr, endDateStr) => {
-  if (!startDateStr) return null;
-  const year = startDateStr.split('-')[0];
-
-  try {
-    const response = await fetch(`https://www.hebcal.com/hebcal?v=1&cfg=json&year=${year}&maj=on&nx=on&lg=he`);
-    const data = await response.json();
-
-    let current = new Date(`${startDateStr.split('T')[0]}T00:00:00`);
-    let end = new Date(`${(endDateStr || startDateStr).split('T')[0]}T23:59:59`);
-    let holidayResults = [];
-
-    while (current <= end) {
-      const y = current.getFullYear();
-      const m = String(current.getMonth() + 1).padStart(2, '0');
-      const d = String(current.getDate()).padStart(2, '0');
-      const dateOnly = `${y}-${m}-${d}`;
-
-      const match = data.items && data.items.find(item => item.date === dateOnly);
-
-      if (match) {
-        const rawTitle = (match.hebrew || match.title || "").toLowerCase();
-
-        let hName = null;
-        if (rawTitle.includes("ראש השנה") || rawTitle.includes("rosh hashanah")) hName = "ראש השנה";
-        else if (rawTitle.includes("כיפור") || rawTitle.includes("yom kippur")) hName = "יום כיפור";
-        else if (rawTitle.includes("סוכות") || rawTitle.includes("sukkot")) hName = "סוכות";
-        else if (rawTitle.includes("פסח") && (rawTitle.includes("א") || rawTitle.includes("1") || rawTitle.includes("ראשון"))) hName = "פסח א'";
-        else if (rawTitle.includes("פסח") && (rawTitle.includes("ב") || rawTitle.includes("2") || rawTitle.includes("שני"))) hName = "פסח ב'";
-        else if (rawTitle.includes("שבועות") || rawTitle.includes("shavuot")) hName = "שבועות";
-
-        if (hName && !holidayResults.includes(hName)) {
-          holidayResults.push(hName);
-        }
-      }
-
-      current.setDate(current.getDate() + 1);
-    }
-
-    return holidayResults.length > 0 ? holidayResults.join(', ') : null;
-  } catch (error) {
-    console.error("שגיאה בשליפת חגים דינאמית:", error);
-    return null;
-  }
-};
-
-const getPrevPeriodStr = (periodStr) => {
-  if (!periodStr) return '';
-  const [half, year] = periodStr.split('.');
-  if (half === '2') return `1.${year}`;
-  const prevYear = (parseInt(year, 10) - 1).toString().padStart(2, '0');
-  return `2.${prevYear}`;
+// הודעת שגיאה אחידה מכל קריאה לשרת
+const showError = (err, fallback = 'קרתה שגיאה, נסו שוב') => {
+  console.error(err);
+  alert(`⚠️ ${err?.message || fallback}`);
 };
 
 const CustomToolbar = (toolbar) => {
@@ -121,14 +72,10 @@ const theme = {
 };
 
 function App() {
-  const [currentUser, setCurrentUser] = useState(() => {
-    try {
-      const savedUser = localStorage.getItem('app_user');
-      return savedUser ? JSON.parse(savedUser) : null;
-    } catch (e) {
-      return null;
-    }
-  });
+  // המשתמש השמור מוצג מיד, והשרת מאמת אותו מחדש (/api/me) — ההרשאות נקבעות רק בשרת
+  const [currentUser, setCurrentUser] = useState(() => getStoredUser());
+  // עד שהשרת מאשר את המשתמש השמור לא מציגים מסך שתלוי בתפקיד
+  const [authChecked, setAuthChecked] = useState(() => !getStoredUser());
 
   const [loginName, setLoginName] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
@@ -150,10 +97,8 @@ function App() {
   const [duplicateFormData, setDuplicateFormData] = useState({ startDate: '', endDate: '', userId: '' });
   const [shiftToDuplicate, setShiftToDuplicate] = useState(null);
   const [exemptionTypes, setExemptionTypes] = useState([]);
-  const [selectedPeriod, setSelectedPeriod] = useState("2026-07");
   const nodeRef = useRef(null);
   const [statsDate, setStatsDate] = useState(new Date());
-  const [currentPeriod] = useState('2.26');
 
   const [squadrons, setSquadrons] = useState([]);
   const [searchTerm, setSearchTerm] = useState('');
@@ -175,7 +120,6 @@ function App() {
     type: 'pet'
   });
   const [newUserExemptionIds, setNewUserExemptionIds] = useState([]);
-  const [isPetModalOpen, setIsPetModalOpen] = useState(false);
   const [selectedSlotDates, setSelectedSlotDates] = useState(null);
   const [adminMyName, setAdminMyName] = useState('');
   const [adminMyPassword, setAdminMyPassword] = useState('');
@@ -210,10 +154,7 @@ function App() {
   const [formData, setFormData] = useState({ startDate: '', endDate: '', userId: '', shiftTypeId: '', isWeekend: false, isBaltam: false, notes: '' });
   const [users, setUsers] = useState([]);
   const [shiftTypes, setShiftTypes] = useState([]);
-  const [customPeriods, setCustomPeriods] = useState([
-    { name: '1.26', startDate: '2026-01-01', endDate: '2026-07-10' },
-    { name: '2.26', startDate: '2026-07-11', endDate: '2027-01-10' }
-  ]);
+  const [customPeriods, setCustomPeriods] = useState([]);
 
   const handlePrevStatsPeriod = () => {
     const newDate = new Date(statsDate);
@@ -229,257 +170,246 @@ function App() {
 
   const fetchSquadrons = async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/squadrons-with-admin`);
-      const data = await res.json();
+      const data = await api('/api/squadrons-with-admin');
       setSquadrons(Array.isArray(data) ? data : []);
     } catch (err) {
       console.error("שגיאה במשיכת טייסות:", err);
     }
   };
 
+  // מחרוזת תקופה (למשל "2.26") לתאריך — לפי התקופות שהוגדרו, אחרת לפי חצי שנה
   const getPeriodStr = (dateInput) => {
     if (!dateInput) return '';
-    const d = new Date(dateInput);
-    if (isNaN(d.getTime())) return '';
-
-    const year = d.getFullYear();
-    const month = String(d.getMonth() + 1).padStart(2, '0');
-    const day = String(d.getDate()).padStart(2, '0');
-    const dateOnly = `${year}-${month}-${day}`;
-
-    const matchedPeriod = customPeriods.find(p => p.startDate && p.endDate && dateOnly >= p.startDate && dateOnly <= p.endDate);
-    if (matchedPeriod) return matchedPeriod.name;
-
-    const shortYear = year.toString().slice(-2);
-    const half = d.getMonth() < 6 ? '1' : '2';
-    return `${half}.${shortYear}`;
+    const dateStr = dateInput instanceof Date
+      ? (isNaN(dateInput.getTime()) ? '' : format(dateInput, 'yyyy-MM-dd'))
+      : cleanDate(dateInput);
+    return dateStr ? getPeriodName(dateStr, customPeriods) : '';
   };
 
   const selectedUserObj = users.find(u => String(u.id) === String(selectedUserId));
   const displayedPeriodStr = getPeriodStr(statsDate);
 
-  const fetchShifts = () => {
+  const fetchShifts = async () => {
     if (!currentUser) return;
-    const orgQuery = currentUser.organization_id ? `?org_id=${currentUser.organization_id}` : '';
-    fetch(`${API_BASE}/api/shifts${orgQuery}`)
-      .then(res => res.json())
-      .then(async data => {
-        if (!Array.isArray(data)) return;
-        let filteredData = data;
-        if (currentUser.role === 'soldier') {
-          filteredData = data.filter(shift => shift.is_published === 1);
-        }
-        const formattedShifts = await Promise.all(filteredData.map(async shift => {
-          const hName = await fetchHebrewHolidayDynamic(shift.start_date, shift.end_date);
-          return {
-            ...shift,
-            id: shift.id,
-            userId: shift.user_id,
-            groupId: shift.group_id,
-            shiftTypeId: shift.shift_type_id,
-            originalStart: shift.start_date,
-            originalEnd: shift.end_date,
-            holidayName: hName,
-            isHoliday: !!hName,
-            title: !shift.user_id
-              ? `⚠️ דרוש שיבוץ - ${shift.type_name}`
-              : `${shift.full_name} - ${shift.type_name}${hName ? ` (${hName})` : ''}${shift.is_published === 1 ? '' : ' (טיוטה)'}`,
-            start: new Date(`${shift.start_date.split('T')[0]}T00:00:00`),
-            end: new Date(`${shift.end_date.split('T')[0]}T23:59:59`),
-            allDay: true,
-            isPublished: shift.is_published === 1,
-            isWeekend: shift.is_weekend === 1,
-            isBaltam: shift.is_baltam === 1,
-            type: 'shift',
-            notes: shift.notes
-          };
-        }));
-
-        setShifts(formattedShifts);
-      })
-      .catch(err => console.error(err));
+    try {
+      // השרת כבר מחזיר לחייל רגיל רק תורנויות מפורסמות
+      const data = await api('/api/shifts');
+      if (!Array.isArray(data)) return;
+      // שנה אחת = בקשה אחת ל-Hebcal (נשמר בזיכרון), ולא בקשה לכל תורנות
+      await prefetchHolidayYears(data.flatMap(s => [s.start_date, s.end_date]));
+      const formattedShifts = await Promise.all(data.map(async shift => {
+        const hName = shift.holiday_name || await getHolidayNameForRange(shift.start_date, shift.end_date);
+        const startStr = cleanDate(shift.start_date);
+        const endStr = cleanDate(shift.end_date);
+        return {
+          ...shift,
+          id: shift.id,
+          userId: shift.user_id,
+          groupId: shift.group_id,
+          shiftTypeId: shift.shift_type_id,
+          originalStart: startStr,
+          originalEnd: endStr,
+          holidayName: hName,
+          isHoliday: !!hName,
+          title: !shift.user_id
+            ? `⚠️ דרוש שיבוץ - ${shift.type_name}${shift.full_name ? ` (היה: ${shift.full_name})` : ''}`
+            : `${shift.full_name || 'חייל לא ידוע'} - ${shift.type_name}${hName ? ` (${hName})` : ''}${shift.is_published === 1 ? '' : ' (טיוטה)'}`,
+          start: new Date(`${startStr}T00:00:00`),
+          end: new Date(`${endStr}T23:59:59`),
+          allDay: true,
+          isPublished: shift.is_published === 1,
+          isWeekend: shift.is_weekend === 1,
+          isBaltam: shift.is_baltam === 1,
+          type: 'shift',
+          notes: shift.notes
+        };
+      }));
+      setShifts(formattedShifts);
+    } catch (err) {
+      console.error("שגיאה במשיכת תורנויות:", err);
+    }
   };
 
-  const handleUnpublishBoard = () => {
+  const handleUnpublishBoard = async () => {
     if (!unpublishFormData.startDate || !unpublishFormData.endDate) {
       alert('חובה למלא טווח תאריכים לביטול הפרסום!');
       return;
     }
-
-    fetch(`${API_BASE}/api/shifts/unpublish-range`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        start_date: unpublishFormData.startDate,
-        end_date: unpublishFormData.endDate,
-        organization_id: currentUser?.organization_id
-      })
-    })
-      .then(res => {
-        if (!res.ok) throw new Error('שגיאה בביטול הפרסום');
-        return res.json();
-      })
-      .then(data => {
-        alert(data.message);
-        setIsUnpublishModalOpen(false);
-        setUnpublishFormData({ startDate: '', endDate: '' });
-        fetchShifts();
-      })
-      .catch(err => {
-        console.error(err);
-        alert('קרתה שגיאה בתקשורת עם השרת');
+    try {
+      const data = await api('/api/shifts/unpublish-range', {
+        method: 'PUT',
+        body: { start_date: unpublishFormData.startDate, end_date: unpublishFormData.endDate }
       });
+      alert(data.message);
+      setIsUnpublishModalOpen(false);
+      setUnpublishFormData({ startDate: '', endDate: '' });
+      fetchShifts();
+    } catch (err) {
+      showError(err);
+    }
   };
 
-  const fetchConstraints = () => {
+  const fetchConstraints = async () => {
     if (!currentUser) return;
-    const orgQuery = currentUser.organization_id ? `?org_id=${currentUser.organization_id}` : '';
-    fetch(`${API_BASE}/api/constraints${orgQuery}`)
-      .then(res => res.json())
-      .then(data => {
-        if (!Array.isArray(data)) return;
-        const formattedConstraints = data.map(c => {
-          let targetName = 'כללי';
-
-          if (c.division && c.division !== 'לא מוגדר' && c.division.trim() !== '') {
-            targetName = `גף ${c.division}`;
-          } else if (c.full_name) {
-            targetName = c.full_name;
-          }
-
-          return {
-            id: `c-${c.id}`,
-            dbId: c.id,
-            userId: c.user_id,
-            division: c.division,
-            originalStart: c.start_date,
-            originalEnd: c.end_date,
-            title: `אילוץ: ${targetName} - ${c.reason}`,
-            start: new Date(`${c.start_date.split('T')[0]}T00:00:00`),
-            end: new Date(`${c.end_date.split('T')[0]}T23:59:59`),
-            allDay: true,
-            type: 'constraint'
-          };
-        });
-        setConstraints(formattedConstraints);
-      })
-      .catch(err => console.error("שגיאה במשיכת אילוצים:", err));
+    try {
+      const data = await api('/api/constraints');
+      if (!Array.isArray(data)) return;
+      setConstraints(data.map(c => {
+        let targetName = 'כל הטייסת';
+        if (c.constraint_type === 'division') targetName = `גף ${c.division}`;
+        else if (c.constraint_type === 'soldier') targetName = c.full_name || 'חייל';
+        const startStr = cleanDate(c.start_date);
+        const endStr = cleanDate(c.end_date);
+        return {
+          ...c, // השדות הגולמיים (start_date, user_id, division, constraint_type) משמשים לבדיקת זכאות
+          id: `c-${c.id}`,
+          dbId: c.id,
+          userId: c.user_id,
+          division: c.division,
+          originalStart: startStr,
+          originalEnd: endStr,
+          title: `אילוץ: ${targetName}${c.reason ? ` - ${c.reason}` : ''}`,
+          start: new Date(`${startStr}T00:00:00`),
+          end: new Date(`${endStr}T23:59:59`),
+          allDay: true,
+          type: 'constraint'
+        };
+      }));
+    } catch (err) {
+      console.error("שגיאה במשיכת אילוצים:", err);
+    }
   };
 
-  const fetchUsers = (orgId) => {
-    const idToUse = orgId || currentUser?.organization_id;
-    if (!idToUse) return;
-
-    fetch(`${API_BASE}/api/users?org_id=${idToUse}`)
-      .then(res => res.json())
-      .then(data => {
-        if (Array.isArray(data)) setUsers(data);
-      })
-      .catch(err => console.error("שגיאה במשיכת משתמשים:", err));
+  const fetchUsers = async () => {
+    if (!currentUser?.organization_id) return;
+    try {
+      const data = await api('/api/users');
+      if (Array.isArray(data)) setUsers(data);
+    } catch (err) {
+      console.error("שגיאה במשיכת משתמשים:", err);
+    }
   };
 
-  const fetchShiftTypes = (orgId) => {
-    const idToUse = orgId || currentUser?.organization_id;
-    const orgQuery = idToUse ? `?org_id=${idToUse}` : '';
-    fetch(`${API_BASE}/api/shift-types${orgQuery}`)
-      .then(res => res.json())
-      .then(data => {
-        if (Array.isArray(data)) setShiftTypes(data);
-      })
-      .catch(err => console.error("שגיאה במשיכת סוגי תורנויות:", err));
+  const fetchShiftTypes = async () => {
+    if (!currentUser?.organization_id) return;
+    try {
+      const data = await api('/api/shift-types');
+      if (Array.isArray(data)) setShiftTypes(data);
+    } catch (err) {
+      console.error("שגיאה במשיכת סוגי תורנויות:", err);
+    }
   };
 
-  const fetchShiftExemptions = () => {
-    fetch(`${API_BASE}/api/shift-exemptions`)
-      .then(res => res.json())
-      .then(data => {
-        if (Array.isArray(data)) setShiftExemptions(data);
-      })
-      .catch(err => console.error("שגיאה במשיכת החלפות:", err));
+  const fetchShiftExemptions = async () => {
+    if (!currentUser?.organization_id) return;
+    try {
+      const data = await api('/api/shift-exemptions');
+      if (Array.isArray(data)) setShiftExemptions(data);
+    } catch (err) {
+      console.error("שגיאה במשיכת החלפות:", err);
+    }
   };
 
-  useEffect(() => {
-    fetchSquadrons();
+  const handleLogout = useCallback(() => {
+    clearSession();
+    setCurrentUser(null);
+    setShifts([]);
+    setUsers([]);
+    setConstraints([]);
+    setShiftExemptions([]);
   }, []);
 
+  // טוקן שפג תוקפו / משתמש שנמחק — חוזרים למסך הכניסה
   useEffect(() => {
-    if (currentUser) {
-      const orgId = currentUser.organization_id;
-      if (orgId) {
-        fetchUsers(orgId);
-      }
+    window.addEventListener('auth:expired', handleLogout);
+    return () => window.removeEventListener('auth:expired', handleLogout);
+  }, [handleLogout]);
 
-      fetchShifts();
-      fetchConstraints();
-      fetchShiftTypes(orgId);
-      fetchShiftExemptions();
-
-      fetch(`${API_BASE}/api/exemption-types`)
-        .then(res => res.json())
-        .then(data => {
-          if (Array.isArray(data)) setExemptionTypes(data);
-        })
-        .catch(err => console.error("שגיאה במשיכת סוגי פטורים:", err));
-
-      setAdminMyName(currentUser.full_name || '');
-      setAdminDoesShifts(currentUser.does_shifts === 1);
-    }
-  }, [currentUser]);
-
+  // אימות המשתמש השמור מול השרת פעם אחת בעליית האפליקציה
   useEffect(() => {
-    if (currentUser && currentUser.organization_id) {
-      fetch(`${API_BASE}/api/periods/${currentUser.organization_id}`)
-        .then(res => res.json())
-        .then(data => {
-          if (Array.isArray(data) && data.length > 0) {
-            setCustomPeriods(data.map(p => ({
-              name: p.name,
-              startDate: p.start_date,
-              endDate: p.end_date
-            })));
-          }
-        })
-        .catch(err => console.error("שגיאה בטעינת תקופות:", err));
-    }
-  }, [currentUser]);
-
-  useEffect(() => {
-    if (currentUser) {
-      fetch(`${API_BASE}/api/shift-exemptions/cleanup`, { method: 'DELETE' })
-        .catch(err => console.error("שגיאה בניקוי החלפות יתומות:", err));
-    }
-  }, [currentUser]);
-
-  const handleLogout = () => {
-    localStorage.removeItem('app_user');
-    setCurrentUser(null);
-  };
-
-  const handleConnectCalendar = () => {
-    fetch(`${API_BASE}/api/calendar/auth-url?userId=${currentUser.id}`)
-      .then(res => res.json())
-      .then(data => {
-        window.location.href = data.url;
-      })
-      .catch(err => console.error("שגיאה ביצירת קישור ליומן:", err));
-  };
-
-  const handleLogin = (e) => {
-    e.preventDefault();
-    fetch(`${API_BASE}/api/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ full_name: loginName, password: loginPassword })
-    })
-      .then(res => {
-        if (!res.ok) throw new Error('שם משתמש או סיסמה שגויים ❌');
-        return res.json();
-      })
+    if (!getStoredUser()) return;
+    api('/api/me')
       .then(data => {
         setCurrentUser(data.user);
-        localStorage.setItem('app_user', JSON.stringify(data.user));
+        setSession(null, data.user);
       })
-      .catch(err => alert(err.message));
+      .catch(() => { /* 401 כבר מטופל ע"י auth:expired */ })
+      .finally(() => setAuthChecked(true));
+  }, []);
+
+  const userKey = currentUser ? `${currentUser.id}|${currentUser.role}|${currentUser.organization_id}` : '';
+
+  // הטעינות אסינכרוניות: ה-setState קורה רק אחרי שהשרת עונה
+  /* eslint-disable react-hooks/set-state-in-effect */
+  useEffect(() => {
+    if (!currentUser || !authChecked) return;
+    if (currentUser.role === 'super_admin') {
+      fetchSquadrons();
+      return;
+    }
+    fetchUsers();
+    fetchShifts();
+    fetchConstraints();
+    fetchShiftTypes();
+    fetchShiftExemptions();
+
+    api('/api/exemption-types')
+      .then(data => { if (Array.isArray(data)) setExemptionTypes(data); })
+      .catch(err => console.error("שגיאה במשיכת סוגי פטורים:", err));
+
+    api('/api/periods')
+      .then(data => {
+        if (Array.isArray(data) && data.length > 0) {
+          setCustomPeriods(data.map(p => ({ name: p.name, startDate: p.start_date, endDate: p.end_date })));
+        }
+      })
+      .catch(err => console.error("שגיאה בטעינת תקופות:", err));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userKey, authChecked]);
+  /* eslint-enable react-hooks/set-state-in-effect */
+
+  const handleConnectCalendar = async () => {
+    if (currentUser.calendar_connected) {
+      if (!window.confirm('היומן כבר מחובר.\n\nאישור = ניתוק הסנכרון\nביטול = סנכרון מחדש עכשיו')) {
+        try {
+          await api('/api/calendar/sync', { method: 'POST' });
+          alert('היומן סונכרן מחדש ✅');
+        } catch (err) {
+          showError(err);
+        }
+        return;
+      }
+      try {
+        await api('/api/calendar', { method: 'DELETE' });
+        const updated = { ...currentUser, calendar_connected: false };
+        setCurrentUser(updated);
+        setSession(null, updated);
+      } catch (err) {
+        showError(err);
+      }
+      return;
+    }
+    try {
+      const data = await api('/api/calendar/auth-url');
+      window.location.href = data.url;
+    } catch (err) {
+      showError(err, 'לא ניתן היה ליצור קישור ליומן');
+    }
+  };
+
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    try {
+      const data = await api('/api/login', {
+        method: 'POST',
+        body: { full_name: loginName, password: loginPassword }
+      });
+      setSession(data.token, data.user);
+      setCurrentUser(data.user);
+      setLoginPassword('');
+    } catch (err) {
+      alert(err.status === 401 ? 'שם משתמש או סיסמה שגויים ❌' : err.message);
+    }
   };
 
   const handleDateSelection = (formType, field, value) => {
@@ -500,304 +430,270 @@ function App() {
     setForm({ ...currentForm, startDate: newStartDate, endDate: newEndDate });
   };
 
-  const handleSaveConstraint = () => {
+  const handleSaveConstraint = async () => {
     if (!constraintFormData.startDate || !constraintFormData.endDate) {
       alert('חובה למלא תאריכים!');
       return;
     }
-
-    fetch(`${API_BASE}/api/constraints`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        organization_id: currentUser.organization_id,
-        user_id: constraintTarget === 'soldier' ? constraintFormData.userId : null,
-        division: constraintTarget === 'division' ? constraintFormData.division : null,
-        constraint_type: constraintTarget,
-        start_date: constraintFormData.startDate,
-        end_date: constraintFormData.endDate,
-        reason: constraintFormData.reason
-      })
-    }).then(() => {
+    // בלי יעד — לא יוצרים בטעות אילוץ שחוסם את כל הטייסת
+    if (constraintTarget === 'soldier' && !constraintFormData.userId) {
+      alert('יש לבחור חייל לאילוץ');
+      return;
+    }
+    if (constraintTarget === 'division' && !String(constraintFormData.division || '').trim()) {
+      alert('יש לבחור גף לאילוץ');
+      return;
+    }
+    if (constraintTarget === 'squadron' && !window.confirm('האילוץ יחסום את כל הטייסת בתאריכים האלה. להמשיך?')) {
+      return;
+    }
+    try {
+      await api('/api/constraints', {
+        method: 'POST',
+        body: {
+          constraint_type: constraintTarget,
+          user_id: constraintTarget === 'soldier' ? constraintFormData.userId : null,
+          division: constraintTarget === 'division' ? constraintFormData.division : null,
+          start_date: constraintFormData.startDate,
+          end_date: constraintFormData.endDate,
+          reason: constraintFormData.reason
+        }
+      });
       setIsConstraintModalOpen(false);
       fetchConstraints();
-    });
+    } catch (err) {
+      showError(err);
+    }
   };
 
-  const handleDeleteConstraint = (dbId) => {
+  const handleDeleteConstraint = async (dbId) => {
     if (!window.confirm('למחוק את האילוץ?')) return;
-    fetch(`${API_BASE}/api/constraints/${dbId}`, { method: 'DELETE' })
-      .then(() => fetchConstraints());
+    try {
+      await api(`/api/constraints/${dbId}`, { method: 'DELETE' });
+      fetchConstraints();
+    } catch (err) {
+      showError(err);
+    }
   };
 
   const deleteSquadron = async (id) => {
     if (!window.confirm("למחוק את הטייסת וכל נתוניה לצמיתות?")) return;
     try {
-      const res = await fetch(`${API_BASE}/api/organizations/${id}`, { method: 'DELETE' });
-      if (res.ok) {
-        setSquadrons(squadrons.filter(s => s.id !== id));
-        setManagingSquadron(null);
-      } else {
-        alert("שגיאה במחיקת הטייסת");
-      }
+      const data = await api(`/api/organizations/${id}`, { method: 'DELETE' });
+      setSquadrons(prev => prev.filter(s => s.id !== id));
+      setManagingSquadron(null);
+      alert(data.message);
     } catch (err) {
-      console.error("שגיאה במחיקת טייסת:", err);
+      showError(err, "שגיאה במחיקת הטייסת");
     }
   };
 
-  const handleSaveUser = () => {
-    if (!newUserName || !newUserPassword) {
+  // 0 הוא ערך חוקי לפוטנציאל — רק שדה ריק הופך ל-100
+  const parsePotentialInput = (value) => {
+    const n = parseInt(value, 10);
+    return Number.isNaN(n) ? 100 : Math.min(100, Math.max(0, n));
+  };
+
+  const handleSaveUser = async () => {
+    if (!newUserName.trim() || !newUserPassword.trim()) {
       alert('חובה למלא שם וסיסמה!');
       return;
     }
-
-    fetch(`${API_BASE}/api/users`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        organization_id: currentUser.organization_id,
-        full_name: newUserName,
-        password: newUserPassword,
-        role: 'soldier',
-        does_shifts: 1,
-        is_active: 1,
-        release_date: newUserReleaseDate,
-        gender: newUserGender,
-        exemptionIds: newUserExemptionIds || [],
-        potential_reduction: parseInt(newUserPotential, 10) || 100,
-        division: newUserDivision
-      })
-    })
-      .then(res => res.json())
-      .then(() => {
-        setNewUserName('');
-        setNewUserPassword('');
-        setNewUserReleaseDate('');
-        setNewUserPotential(100);
-        setNewUserExemptionIds([]);
-        setNewUserGender('male');
-        setNewUserDivision('');
-        alert('החייל גויס בהצלחה! 🧑‍✈️');
-        fetchUsers(currentUser.organization_id);
-      })
-      .catch(err => console.error("שגיאה בהוספת חייל:", err));
-  };
-
-  const doesRangeContainShabbat = (start, end) => {
-    if (!start || !end) return false;
-
-    let currentDate = new Date(`${start.split('T')[0]}T00:00:00`);
-    const endDate = new Date(`${end.split('T')[0]}T23:59:59`);
-
-    while (currentDate <= endDate) {
-      if (currentDate.getDay() === 6) return true;
-      currentDate.setDate(currentDate.getDate() + 1);
+    try {
+      await api('/api/users', {
+        method: 'POST',
+        body: {
+          full_name: newUserName.trim(),
+          password: newUserPassword,
+          role: 'soldier',
+          does_shifts: 1,
+          is_active: 1,
+          release_date: newUserReleaseDate || null,
+          gender: newUserGender,
+          exemptionIds: newUserExemptionIds || [],
+          potential_reduction: parsePotentialInput(newUserPotential),
+          division: newUserDivision
+        }
+      });
+      setNewUserName('');
+      setNewUserPassword('');
+      setNewUserReleaseDate('');
+      setNewUserPotential(100);
+      setNewUserExemptionIds([]);
+      setNewUserGender('male');
+      setNewUserDivision('');
+      alert('החייל גויס בהצלחה! 🧑‍✈️');
+      fetchUsers();
+    } catch (err) {
+      showError(err, "שגיאה בהוספת חייל");
     }
-    return false;
   };
 
-  const handleUpdateOneself = () => {
+  const doesRangeContainShabbat = (start, end) => rangeContainsShabbat(start, end);
+
+  // עדכון הפרטים שלי — רק שם, סיסמה והשתתפות בסבב. פטורים ושאר השדות לא נשלחים ולכן לא נדרסים.
+  const handleUpdateOneself = async () => {
     if (!currentUser) return;
-
-    const newDoesShiftsValue = adminDoesShifts ? 1 : 0;
-
-    fetch(`${API_BASE}/api/users/${currentUser.id}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        full_name: adminMyName,
-        password: adminMyPassword,
-        release_date: currentUser.release_date,
-        potential_reduction: currentUser.potential_reduction,
-        exemptionIds: currentUser.exemptionIds || [],
-        does_shifts: newDoesShiftsValue
-      })
-    })
-      .then(res => res.json())
-      .then(() => {
-        alert('הפרטים עודכנו בהצלחה!');
-        const updatedUser = {
-          ...currentUser,
-          full_name: adminMyName,
-          does_shifts: newDoesShiftsValue
-        };
-        setCurrentUser(updatedUser);
-        localStorage.setItem('app_user', JSON.stringify(updatedUser));
-        setAdminMyPassword('');
-        fetchUsers(currentUser.organization_id);
-      })
-      .catch(err => console.error("שגיאה בעדכון:", err));
+    const body = { full_name: adminMyName, does_shifts: adminDoesShifts ? 1 : 0 };
+    if (adminMyPassword.trim()) body.password = adminMyPassword;
+    try {
+      const data = await api('/api/me', { method: 'PUT', body });
+      setCurrentUser(data.user);
+      setSession(null, data.user);
+      setAdminMyPassword('');
+      alert('הפרטים עודכנו בהצלחה!');
+      fetchUsers();
+    } catch (err) {
+      showError(err, "שגיאה בעדכון");
+    }
   };
 
+  // התראה מיידית בעת שינוי שדות בטופס
   const checkConflict = (userId, start, end, shiftTypeId) => {
-    if (!userId || !start || !end) return;
-
-    const selectedUser = users.find(u => String(u.id) === String(userId));
-    const selectedType = shiftTypes.find(t => String(t.id) === String(shiftTypeId));
-    if (!selectedUser) return;
-
-    const userExemptions = selectedUser.exemptionIds || [];
-
-    if (userExemptions.includes(4) && doesRangeContainShabbat(start, end)) {
-      alert(`⚠️ התראה: ל-${selectedUser.full_name} יש פטור שבתות, והטווח הנבחר כולל שבת!`);
-    }
-
-    if (selectedType) {
-      if (userExemptions.includes(1) && selectedType.name.includes('מטבח')) {
-        alert(`⚠️ התראה: ל-${selectedUser.full_name} יש פטור מטבח!`);
-      }
-      if (userExemptions.includes(2) && selectedType.name.includes('שמירה')) {
-        alert(`⚠️ התראה: ל-${selectedUser.full_name} יש פטור שמירה!`);
-      }
+    const result = validateShift(userId, shiftTypeId, start, end);
+    if (result !== true) {
+      alert(`⚠️ התראה: ${result}`);
     }
   };
 
-  const handleUpdateSoldier = (id, fullName, password, releaseDate, potentialReduction, exemptionIds) => {
-    if (!fullName) {
+  // רשימת החיילים בסבב שזמינים לשיבוץ בתאריכים ובסוג התורנות שנבחרו
+  const getAvailableSoldiers = (startDate = formData.startDate, endDate = formData.endDate, shiftTypeId = formData.shiftTypeId, keepUserId = formData.userId) => {
+    return users.filter(u => {
+      if (u.is_active !== 1 || u.does_shifts !== 1) return false;
+      if (startDate && endDate) {
+        const isValid = validateShift(u.id, shiftTypeId, startDate, endDate);
+        // משאירים ברשימה את החייל שכבר נבחר (כדי שהשדה לא יתרוקן), אבל מסננים אחרים שחסומים
+        if (isValid !== true && String(u.id) !== String(keepUserId)) {
+          return false;
+        }
+      }
+      return true;
+    });
+  };
+
+  const handleUpdateSoldier = async (id, fullName, password, releaseDate, potentialReduction, exemptionIds) => {
+    if (!String(fullName || '').trim()) {
       alert('השם לא יכול להיות ריק!');
       return;
     }
-
-    fetch(`${API_BASE}/api/users/${id}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        full_name: fullName,
-        password: password,
-        release_date: releaseDate || null,
-        potential_reduction: parseInt(potentialReduction, 10) || 100,
-        does_shifts: editingSoldier.does_shifts,
-        exemptionIds: exemptionIds || []
-      })
-    })
-      .then(res => {
-        if (!res.ok) throw new Error("שגיאה בעדכון");
-        return res.json();
-      })
-      .then(() => {
-        alert('נתוני החייל עודכנו בהצלחה! 💾');
-        fetchUsers(currentUser.organization_id);
-        setEditingSoldier(null);
-      })
-      .catch(err => {
-        console.error("שגיאה:", err);
-        alert("לא ניתן היה לעדכן את הפטורים.");
-      });
+    const body = {
+      full_name: fullName,
+      release_date: releaseDate || null,
+      potential_reduction: parsePotentialInput(potentialReduction),
+      does_shifts: editingSoldier.does_shifts,
+      exemptionIds: exemptionIds || []
+    };
+    if (String(password || '').trim()) body.password = password;
+    try {
+      await api(`/api/users/${id}`, { method: 'PUT', body });
+      alert('נתוני החייל עודכנו בהצלחה! 💾');
+      fetchUsers();
+      setEditingSoldier(null);
+    } catch (err) {
+      showError(err, "לא ניתן היה לעדכן את החייל.");
+    }
   };
 
-  const handleDeleteSoldier = (id) => {
+  const handleDeleteSoldier = async (id) => {
     const userObj = users.find(u => u.id === id);
     const msg = `⚠️ אזהרה! ⚠️\n\nאת עומדת למחוק את "${userObj?.full_name}".\n\n- כל התורנויות העתידיות שלו יהפכו ל"דרוש שיבוץ".\n- היסטוריית התורנויות שלו תישמר בסטטיסטיקות.\n\nהאם להמשיך?`;
-
     if (!window.confirm(msg)) return;
-
-    fetch(`${API_BASE}/api/users/${id}`, { method: 'DELETE' })
-      .then(() => {
-        fetchUsers();
-        fetchShifts();
-        if (selectedUserId === id) setSelectedUserId(null);
-      })
-      .catch(err => console.error("שגיאה במחיקה:", err));
+    try {
+      const data = await api(`/api/users/${id}`, { method: 'DELETE' });
+      alert(data.message);
+      fetchUsers();
+      fetchShifts();
+      fetchConstraints();
+      if (selectedUserId === id) setSelectedUserId(null);
+    } catch (err) {
+      showError(err, "שגיאה במחיקה");
+    }
   };
 
   const handleSaveShiftType = async () => {
-    if (!shiftTypeForm.name) {
+    if (!shiftTypeForm.name.trim()) {
       alert('חובה למלא שם סוג תורנות!');
       return;
     }
-
-    const colorToSave = shiftTypeForm.color || '#3174ad';
-
     try {
-      const response = await fetch(`${API_BASE}/api/shift-types`, {
+      await api('/api/shift-types', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          organization_id: currentUser.organization_id,
-          name: shiftTypeForm.name,
+        body: {
+          name: shiftTypeForm.name.trim(),
           is_weekend: 0,
-          color: colorToSave,
+          color: shiftTypeForm.color || '#3174ad',
           points_base: shiftTypeForm.points_base || 1.0,
           gender_limit: newShiftTypeGenderLimit || 'all'
-        })
+        }
       });
-
-      if (!response.ok) throw new Error("שגיאה בשמירת סוג התורנות");
-
       setShiftTypeForm({ name: '', isWeekend: false, color: '#3174ad', points_base: 1.0 });
       setNewShiftTypeGenderLimit('all');
       alert('סוג תורנות נוצר בהצלחה!');
-      fetchShiftTypes(currentUser.organization_id);
+      fetchShiftTypes();
     } catch (err) {
-      console.error("שגיאה ביצירת סוג תורנות:", err);
-      alert("קרתה שגיאה, נסי שוב");
+      showError(err);
     }
   };
 
-  const getAvailableSoldiers = () => {
-    return users.filter(u => u.is_active === 1 && u.does_shifts === 1);
-  };
-
   const checkIsDateWithinWeek = (targetDate) => {
-    if (!targetDate) return false;
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const shiftDate = new Date(`${targetDate.split('T')[0]}T00:00:00`);
-    const diffDays = Math.ceil((shiftDate.getTime() - today.getTime()) / (1000 * 3600 * 24));
-    return diffDays >= 0 && diffDays <= 7;
+    const target = cleanDate(targetDate);
+    if (!target) return false;
+    const today = todayInIsrael();
+    return target >= today && target <= addDays(today, 7);
   };
 
   const forcedBaltam = !editingShiftId && checkIsDateWithinWeek(formData.startDate);
   const displayBaltam = forcedBaltam || formData.isBaltam;
 
-  const validateShift = (userId, shiftTypeId) => {
+  // אותה בדיקת זכאות שהשרת מריץ (shared/rules.js) — כאן רק להתראה מיידית ולסינון הרשימה
+  const validateShift = (userId, shiftTypeId, startDate = formData.startDate, endDate = formData.endDate) => {
+    if (!userId || !startDate || !endDate) return true;
     const selectedUser = users.find(u => String(u.id) === String(userId));
-    const selectedType = shiftTypes.find(t => String(t.id) === String(shiftTypeId));
-
-    if (!selectedUser || !selectedType) return true;
-
-    const userExemptions = selectedUser.exemptionIds || [];
-    if (userExemptions.includes(1) && selectedType.name.includes('מטבח')) return "לחייל זה יש פטור מטבח!";
-    if (userExemptions.includes(2) && selectedType.name.includes('שמירה')) return "לחייל זה יש פטור שמירות!";
-    if (userExemptions.includes(3) && selectedType.name.includes('רס"ר')) return "לחייל זה יש פטור רס\"ר!";
-    if (userExemptions.includes(4) && formData.isWeekend) return "לחייל זה יש פטור שבתות!";
-
-    return true;
+    if (!selectedUser) return true;
+    const shiftType = shiftTypes.find(t => String(t.id) === String(shiftTypeId));
+    const result = checkEligibility({
+      user: selectedUser,
+      startDate,
+      endDate,
+      shiftType,
+      exemptionTypes,
+      constraints
+    });
+    return result.ok ? true : result.reason;
   };
 
   const handleSaveShift = async () => {
+    if (!formData.startDate || !formData.endDate || !formData.shiftTypeId) {
+      alert('יש למלא תאריכים וסוג תורנות!');
+      return;
+    }
     const validationResult = validateShift(formData.userId, formData.shiftTypeId);
     if (validationResult !== true) {
       alert(`⚠️ שיבוץ לא תקין: ${validationResult}`);
       return;
     }
-    if (!formData.startDate || !formData.endDate || !formData.shiftTypeId) {
-      alert('שדות חובה!');
-      return;
-    }
-    const method = editingShiftId ? 'PUT' : 'POST';
-    const url = editingShiftId ? `${API_BASE}/api/shifts/${editingShiftId}` : `${API_BASE}/api/shifts`;
     const finalBaltam = forcedBaltam ? true : formData.isBaltam;
-    const holiday = await fetchHebrewHolidayDynamic(formData.startDate, formData.endDate);
-
-    fetch(url, {
-      method,
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        organization_id: currentUser.organization_id,
-        user_id: formData.userId || null,
-        shift_type_id: formData.shiftTypeId,
-        start_date: formData.startDate,
-        end_date: formData.endDate,
-        is_weekend: formData.isWeekend,
-        is_baltam: finalBaltam,
-        notes: formData.notes,
-        holiday_name: holiday
-      })
-    }).then(() => {
+    try {
+      const holiday = await getHolidayNameForRange(formData.startDate, formData.endDate);
+      await api(editingShiftId ? `/api/shifts/${editingShiftId}` : '/api/shifts', {
+        method: editingShiftId ? 'PUT' : 'POST',
+        body: {
+          user_id: formData.userId || null,
+          shift_type_id: formData.shiftTypeId,
+          start_date: formData.startDate,
+          end_date: formData.endDate,
+          is_weekend: Boolean(formData.isWeekend),
+          is_baltam: finalBaltam,
+          notes: formData.notes,
+          holiday_name: holiday
+        }
+      });
       setIsModalOpen(false);
       fetchShifts();
-    });
+    } catch (err) {
+      // למשל: השרת דחה בגלל אילוץ/פטור — המודאל נשאר פתוח כדי שאפשר יהיה לתקן
+      showError(err, 'שמירת התורנות נכשלה');
+    }
   };
 
   const handleSplitShift = async () => {
@@ -805,96 +701,40 @@ function App() {
       alert('נא לבחור תאריך לפיצול!');
       return;
     }
-
     const shiftType = shiftTypes.find(t => String(t.id) === String(formData.shiftTypeId));
-    const isGuardShift = shiftType && shiftType.name.includes('שמיר');
-
-    const timeToSplit = isGuardShift ? '14:00:00' : '00:00:00';
-    const splitPoint = new Date(`${splitDate}T${timeToSplit}`);
-    const originalStart = new Date(`${formData.startDate}T00:00:00`);
-    const originalEnd = new Date(`${formData.endDate}T23:59:59`);
-
-    if (splitPoint <= originalStart || splitPoint >= originalEnd) {
-      alert('תאריך הפיצול חייב להיות בתוך טווח התורנות!');
+    const guard = isGuardType(shiftType);
+    // תורנות רגילה: החלק הראשון מסתיים יום לפני תאריך הפיצול. שמירות: ההחלפה ב-14:00 באותו יום.
+    if ((!guard && splitDate <= formData.startDate) || splitDate > formData.endDate || splitDate < formData.startDate) {
+      alert('תאריך הפיצול חייב להיות בתוך טווח התורנות (ואחרי יום ההתחלה)!');
       return;
     }
-
-    const originalShift = shifts.find(s => String(s.id) === String(editingShiftId));
-    const sharedGroupId = originalShift?.groupId || `grp_split_${Date.now()}`;
-
-    const firstPartEndStr = splitDate;
-    const isFirstPartWeekend = doesRangeContainShabbat(formData.startDate, firstPartEndStr);
-    const isSecondPartWeekend = doesRangeContainShabbat(splitDate, formData.endDate);
-
     try {
-      await fetch(`${API_BASE}/api/shifts/${editingShiftId}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          organization_id: currentUser.organization_id,
-          user_id: formData.userId,
-          shift_type_id: formData.shiftTypeId,
-          start_date: formData.startDate,
-          end_date: firstPartEndStr,
-          is_weekend: isFirstPartWeekend,
-          is_baltam: formData.isBaltam,
-          notes: formData.notes,
-          group_id: sharedGroupId
-        })
-      });
-
-      await fetch(`${API_BASE}/api/shifts`, {
+      const data = await api(`/api/shifts/${editingShiftId}/split`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          organization_id: currentUser.organization_id,
-          user_id: null,
-          shift_type_id: formData.shiftTypeId,
-          start_date: splitDate,
-          end_date: formData.endDate,
-          is_weekend: isSecondPartWeekend,
-          is_baltam: formData.isBaltam,
-          notes: formData.notes,
-          group_id: sharedGroupId
-        })
+        body: { split_date: splitDate }
       });
-
-      alert('התורנות פוצלה בהצלחה! ✂️');
+      alert(data.message);
       setIsSplitModalOpen(false);
       setIsModalOpen(false);
+      setSplitDate('');
       fetchShifts();
+      fetchShiftExemptions();
     } catch (err) {
-      console.error(err);
-      alert('שגיאה בתהליך הפיצול');
+      showError(err, 'שגיאה בתהליך הפיצול');
     }
   };
 
   const handleDelete = async () => {
+    if (!editingShiftId) return;
+    if (!window.confirm('למחוק את התורנות?')) return;
     try {
-      const originalShiftId = editingShiftId ? editingShiftId.toString().split('-')[0] : null;
-      const existingExemption = shiftExemptions.find(ex => String(ex.shift_id) === String(originalShiftId));
-
-      if (existingExemption) {
-        await fetch(`${API_BASE}/api/shift-exemptions/${existingExemption.id}`, {
-          method: 'DELETE'
-        });
-      }
-
-      const response = await fetch(`${API_BASE}/api/shifts/${originalShiftId}`, {
-        method: 'DELETE'
-      });
-
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data.error || 'משהו השתבש במחיקה');
-      }
-
+      // השרת מוחק גם את ההחלפות של התורנות
+      await api(`/api/shifts/${String(editingShiftId).split('-')[0]}`, { method: 'DELETE' });
       setIsModalOpen(false);
       fetchShifts();
       fetchShiftExemptions();
-    } catch (error) {
-      console.error("שגיאת מחיקה:", error.message);
-      alert("לא ניתן היה למחוק את התורנות: " + error.message);
+    } catch (err) {
+      showError(err, 'לא ניתן היה למחוק את התורנות');
     }
   };
 
@@ -903,79 +743,79 @@ function App() {
       userId: formData.userId,
       shiftTypeId: formData.shiftTypeId,
       isWeekend: formData.isWeekend,
-      isBaltam: formData.isBaltam
+      isBaltam: formData.isBaltam,
+      notes: formData.notes
     });
     setDuplicateFormData({ startDate: '', endDate: '', userId: formData.userId });
     setIsModalOpen(false);
     setIsDuplicateModalOpen(true);
   };
 
-  const handleSaveDuplicate = () => {
+  const handleSaveDuplicate = async () => {
     if (!duplicateFormData.startDate || !duplicateFormData.endDate || !duplicateFormData.userId) {
       alert('חובה למלא תאריכים וחייל!');
       return;
     }
-
-    const isWithinWeek = checkIsDateWithinWeek(duplicateFormData.startDate);
-    const finalBaltam = isWithinWeek ? true : shiftToDuplicate.isBaltam;
-    const isWeekendDup = doesRangeContainShabbat(duplicateFormData.startDate, duplicateFormData.endDate);
-
-    fetch(`${API_BASE}/api/shifts`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        organization_id: currentUser.organization_id,
-        user_id: duplicateFormData.userId,
-        shift_type_id: shiftToDuplicate.shiftTypeId,
-        start_date: duplicateFormData.startDate,
-        end_date: duplicateFormData.endDate,
-        is_weekend: isWeekendDup,
-        is_baltam: finalBaltam
-      })
-    }).then(() => {
+    const validationResult = validateShift(
+      duplicateFormData.userId,
+      shiftToDuplicate.shiftTypeId,
+      duplicateFormData.startDate,
+      duplicateFormData.endDate
+    );
+    if (validationResult !== true) {
+      alert(`⚠️ שיבוץ לא תקין: ${validationResult}`);
+      return;
+    }
+    const finalBaltam = checkIsDateWithinWeek(duplicateFormData.startDate) ? true : shiftToDuplicate.isBaltam;
+    try {
+      const holiday = await getHolidayNameForRange(duplicateFormData.startDate, duplicateFormData.endDate);
+      await api('/api/shifts', {
+        method: 'POST',
+        body: {
+          user_id: duplicateFormData.userId,
+          shift_type_id: shiftToDuplicate.shiftTypeId,
+          start_date: duplicateFormData.startDate,
+          end_date: duplicateFormData.endDate,
+          is_weekend: doesRangeContainShabbat(duplicateFormData.startDate, duplicateFormData.endDate),
+          is_baltam: finalBaltam,
+          notes: shiftToDuplicate.notes || '',
+          holiday_name: holiday
+        }
+      });
       setIsDuplicateModalOpen(false);
       setShiftToDuplicate(null);
       fetchShifts();
-    });
+    } catch (err) {
+      showError(err, 'השכפול נכשל');
+    }
   };
 
-  const handlePublishBoard = () => {
+  const handlePublishBoard = async () => {
     if (!publishFormData.startDate || !publishFormData.endDate) {
       alert('חובה למלא טווח תאריכים!');
       return;
     }
-
-    fetch(`${API_BASE}/api/shifts/publish-range`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        start_date: publishFormData.startDate,
-        end_date: publishFormData.endDate,
-        organization_id: currentUser?.organization_id
-      })
-    })
-      .then(res => res.json())
-      .then(data => {
-        alert(data.message);
-        setIsPublishModalOpen(false);
-        setPublishFormData({ startDate: '', endDate: '' });
-        fetchShifts();
-      })
-      .catch(err => console.error("שגיאה:", err));
+    try {
+      const data = await api('/api/shifts/publish-range', {
+        method: 'PUT',
+        body: { start_date: publishFormData.startDate, end_date: publishFormData.endDate }
+      });
+      alert(data.message);
+      setIsPublishModalOpen(false);
+      setPublishFormData({ startDate: '', endDate: '' });
+      fetchShifts();
+    } catch (err) {
+      showError(err);
+    }
   };
 
   const deleteReplacement = async (exemptionId) => {
     try {
-      const response = await fetch(`${API_BASE}/api/shift-exemptions/${exemptionId}`, {
-        method: 'DELETE'
-      });
-
-      if (!response.ok) throw new Error("שגיאה במחיקת ההחלפה");
-
+      await api(`/api/shift-exemptions/${exemptionId}`, { method: 'DELETE' });
       alert("ההחלפה הוסרה והתורנות המקורית חזרה");
       fetchShiftExemptions();
     } catch (err) {
-      console.error(err);
+      showError(err, "שגיאה במחיקת ההחלפה");
     }
   };
 
@@ -1016,10 +856,20 @@ function App() {
           end_date: existingExemption.end_date,
           type: existingExemption.type
         });
+        setReplacementForm({
+          type: existingExemption.type || 'pet',
+          startDate: existingExemption.start_date || '',
+          endDate: existingExemption.end_date || '',
+          startTime: existingExemption.start_time || '',
+          endTime: existingExemption.end_time || ''
+        });
       } else {
         setHasReplacement(false);
         setReplacementData({ shift_id: originalShiftId, start_date: '', end_date: '', type: 'pet' });
+        setReplacementForm({ type: 'pet', startDate: '', endDate: '', startTime: '', endTime: '' });
       }
+      setSplitDate('');
+      setIsSplitModalOpen(false);
 
       setEditingShiftId(originalShiftId);
       setFormData({
@@ -1027,7 +877,7 @@ function App() {
         endDate: event.originalEnd,
         userId: event.userId || '',
         shiftTypeId: event.shiftTypeId || '',
-        isWeekend: doesRangeContainShabbat(event.originalStart, event.originalEnd),
+        isWeekend: Boolean(event.isWeekend),
         isBaltam: Boolean(event.isBaltam),
         notes: event.notes || ''
       });
@@ -1270,46 +1120,36 @@ function App() {
   };
 
   const handleCreateSquadronAndAdmin = async () => {
-    if (!squadronName || !adminName || !adminPassword) {
+    if (!squadronName.trim() || !adminName.trim() || !adminPassword) {
       alert("נא למלא את כל השדות!");
       return;
     }
-
     try {
-      const response = await fetch(`${API_BASE}/api/setup-squadron`, {
+      await api('/api/setup-squadron', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          squadronData: { name: squadronName },
-          adminData: { full_name: adminName, password: adminPassword }
-        })
+        body: {
+          squadronData: { name: squadronName.trim() },
+          adminData: { full_name: adminName.trim(), password: adminPassword }
+        }
       });
-
-      if (response.ok) {
-        const result = await response.json();
-        const newSquadron = { id: result.squadronId, name: squadronName, admin_name: adminName };
-        setSquadrons([...squadrons, newSquadron]);
-        setSquadronName('');
-        setAdminName('');
-        setAdminPassword('');
-        alert('הטייסת והאחראי הוקמו בהצלחה! 🚀');
-      } else {
-        alert("שגיאה בהקמת הטייסת בשרת");
-      }
+      setSquadronName('');
+      setAdminName('');
+      setAdminPassword('');
+      alert('הטייסת והאחראי הוקמו בהצלחה! 🚀');
+      fetchSquadrons();
     } catch (err) {
-      console.error("שגיאה:", err);
+      showError(err, "שגיאה בהקמת הטייסת");
     }
   };
 
   const openSquadronManagement = async (squadron) => {
     setManagingSquadron(squadron);
-
+    setSquadronUsers([]);
     try {
-      const response = await fetch(`${API_BASE}/api/users?org_id=${squadron.id}`);
-      const data = await response.json();
+      const data = await api(`/api/users?org_id=${squadron.id}`);
       setSquadronUsers(Array.isArray(data) ? data : []);
     } catch (err) {
-      console.error("שגיאה בטעינת חיילים:", err);
+      showError(err, "שגיאה בטעינת חיילים");
     }
   };
 
@@ -1317,41 +1157,34 @@ function App() {
 
   const updateAdmin = async (newAdminId) => {
     try {
-      await fetch(`${API_BASE}/api/users/update-admin/${managingSquadron.id}`, {
+      await api(`/api/users/update-admin/${managingSquadron.id}`, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ newAdminId })
+        body: { newAdminId }
       });
-
-      setSquadronUsers(prevUsers => {
-        const updatedUsers = prevUsers.map(u => {
+      setSquadronUsers(prevUsers => prevUsers
+        .map(u => {
           if (u.id === newAdminId) return { ...u, role: 'admin' };
           if (u.role === 'admin') return { ...u, role: 'soldier' };
           return u;
-        });
-
-        return updatedUsers.sort((a, b) => (a.role === 'admin' ? -1 : 1));
-      });
-
+        })
+        .sort((a, b) => (a.role === 'admin' ? -1 : 0) - (b.role === 'admin' ? -1 : 0)));
       fetchSquadrons();
       alert("האחראי עודכן בהצלחה!");
     } catch (err) {
-      console.error("שגיאה בעדכון אחראי:", err);
+      showError(err, "שגיאה בעדכון אחראי");
     }
   };
 
-  const deleteUser = (userId) => {
-    fetch(`${API_BASE}/api/users/${userId}`, { method: 'DELETE' })
-      .then(res => res.json())
-      .then(() => {
-        if (managingSquadron) {
-          setSquadronUsers(prev => prev.filter(u => u.id !== userId));
-        }
-        if (currentUser?.organization_id) {
-          fetchUsers(currentUser.organization_id);
-        }
-      })
-      .catch(err => console.error("שגיאה במחיקה:", err));
+  const deleteUser = async (userId) => {
+    const target = squadronUsers.find(u => u.id === userId);
+    if (!window.confirm(`למחוק את "${target?.full_name || 'המשתמש'}"? תורנויות עתידיות שלו יחזרו לשיבוץ.`)) return;
+    try {
+      await api(`/api/users/${userId}`, { method: 'DELETE' });
+      setSquadronUsers(prev => prev.filter(u => u.id !== userId));
+      fetchSquadrons();
+    } catch (err) {
+      showError(err, "שגיאה במחיקה");
+    }
   };
 
   // === חישובי נתונים סטטיסטיים לפי התקופה הנבחרת ===
@@ -1366,91 +1199,22 @@ function App() {
     count: displayedPeriodShifts.filter(s => String(s.shiftTypeId) === String(type.id)).length
   }));
 
-  function calculateTotalPointsInPeriod(shiftsList, exemptions, typesList) {
-    let totalPoints = 0;
+  // נקודות נטו — אותו חישוב שהשרת משתמש בו לשיבוץ האוטומטי (shared/rules.js)
+  const typeById = (id) => shiftTypes.find(t => String(t.id) === String(id));
 
-    shiftsList.forEach(s => {
-      const type = typesList.find(t => String(t.id) === String(s.shiftTypeId || s.shift_type_id));
-      const basePoints = type?.points_base ? Number(type.points_base) : 1.0;
-
-      let current = new Date(`${s.originalStart.split('T')[0]}T00:00:00`);
-      let end = new Date(`${s.originalEnd.split('T')[0]}T23:59:59`);
-      let totalDaysInShift = Math.round((end - current) / (1000 * 60 * 60 * 24)) + 1;
-      let dayIndex = 0;
-      let shiftPoints = 0;
-
-      while (current <= end) {
-        let dailyValue = basePoints;
-
-        if (type && type.name.includes('שמירות')) {
-          if (dayIndex === 0 || dayIndex === totalDaysInShift - 1) {
-            dailyValue = 0.5 * basePoints;
-          }
-        } else if (type && type.name.includes('מטבח')) {
-          if ((!s.isWeekend && current.getDay() === 4) || (s.isWeekend && current.getDay() === 1)) {
-            dailyValue = 0.5 * basePoints;
-          }
-        }
-
-        shiftPoints += dailyValue;
-        current.setDate(current.getDate() + 1);
-        dayIndex++;
-      }
-
-      const originalShiftId = s.id ? s.id.toString().split('-')[0] : null;
-      const relevantExemptions = exemptions.filter(ex =>
-        ex.shift_id && originalShiftId && String(ex.shift_id) === String(originalShiftId) && (ex.type === 'pet' || ex.type === 'squadron')
-      );
-
-      if (relevantExemptions.length > 0) {
-        let currentCheck = new Date(`${s.originalStart.split('T')[0]}T00:00:00`);
-        let checkEnd = new Date(`${s.originalEnd.split('T')[0]}T23:59:59`);
-        let daysToSubtract = 0;
-        let dayIdx = 0;
-
-        while (currentCheck <= checkEnd) {
-          const isCovered = relevantExemptions.some(ex => {
-            const exStart = new Date(`${ex.start_date.split('T')[0]}T00:00:00`);
-            const exEnd = new Date(`${ex.end_date.split('T')[0]}T23:59:59`);
-            return currentCheck >= exStart && currentCheck <= exEnd;
-          });
-
-          if (isCovered) {
-            let dailyValue = basePoints;
-            if (type && type.name.includes('שמירות')) {
-              if (dayIdx === 0 || dayIdx === totalDaysInShift - 1) {
-                dailyValue = 0.5 * basePoints;
-              }
-            } else if (type && type.name.includes('מטבח')) {
-              const dayOfWeek = currentCheck.getDay();
-              if ((!s.isWeekend && dayOfWeek === 4) || (s.isWeekend && dayOfWeek === 1)) {
-                dailyValue = 0.5 * basePoints;
-              }
-            }
-            daysToSubtract += dailyValue;
-          }
-
-          currentCheck.setDate(currentCheck.getDate() + 1);
-          dayIdx++;
-        }
-
-        shiftPoints = Math.max(0, shiftPoints - daysToSubtract);
-      }
-
-      totalPoints += shiftPoints;
-    });
-
-    return Number(totalPoints.toFixed(2));
+  function calculateTotalPointsInPeriod(shiftsList, exemptions) {
+    const total = shiftsList.reduce((sum, s) => sum + computeShiftPoints(s, typeById(s.shift_type_id), exemptions), 0);
+    return Number(total.toFixed(2));
   }
 
   const totalPotential = users
     .filter(u => u.is_active === 1 && u.does_shifts === 1)
-    .reduce((sum, u) => sum + (u.potential_reduction || 100), 0);
+    .reduce((sum, u) => sum + potentialOf(u), 0);
 
-  const totalNetPointsInPeriod = calculateTotalPointsInPeriod(displayedPeriodShifts, shiftExemptions, shiftTypes);
+  const totalNetPointsInPeriod = calculateTotalPointsInPeriod(displayedPeriodShifts, shiftExemptions);
 
   const soldierQuota = (selectedUserObj && totalPotential > 0)
-    ? (selectedUserObj.potential_reduction / totalPotential) * totalNetPointsInPeriod
+    ? (potentialOf(selectedUserObj) / totalPotential) * totalNetPointsInPeriod
     : 0;
 
   const quota = soldierQuota > 0 ? soldierQuota : 1;
@@ -1478,29 +1242,16 @@ function App() {
   };
 
   const handleAutoAssign = async () => {
-    if (!window.confirm("⚠️ האם להפעיל שיבוץ אוטומטי? המערכת תמלא את כל התורנויות הריקות לפי אילוצים ופטורים.")) {
+    if (!window.confirm("⚠️ האם להפעיל שיבוץ אוטומטי? המערכת תמלא את התורנויות העתידיות הריקות לפי אילוצים, פטורים ואיזון נקודות בתקופה.")) {
       return;
     }
-
     try {
-      const response = await fetch(`${API_BASE}/api/auto-assign`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ org_id: currentUser.organization_id })
-      });
-
-      const data = await response.json();
-
-      if (data.success) {
-        alert("השיבוץ הושלם בהצלחה! 🚀");
-        fetchShifts();
-        fetchUsers();
-      } else {
-        alert("שגיאה בשיבוץ: " + data.message);
-      }
-    } catch (error) {
-      console.error("Auto assign error:", error);
-      alert("לא ניתן היה לבצע שיבוץ אוטומטי, אנא בדקי את השרת.");
+      const data = await api('/api/auto-assign', { method: 'POST' });
+      alert(`${data.message} 🚀`);
+      fetchShifts();
+      fetchUsers();
+    } catch (err) {
+      showError(err, "לא ניתן היה לבצע שיבוץ אוטומטי");
     }
   };
 
@@ -1517,171 +1268,19 @@ function App() {
     }
   };
 
-  const getNetStats = (userId, periodShiftsList, typesList) => {
-    if (!periodShiftsList || !Array.isArray(periodShiftsList)) {
-      return {
-        netPoints: 0,
-        netShabbats: 0,
-        shabbatExemptionPoints: 0,
-        shosh: 0,
-        mkutzarot: 0,
-        shushCount: 0,
-        mkuzeretCount: 0
-      };
+  const getNetStats = (userId, periodShiftsList) => {
+    if (!Array.isArray(periodShiftsList)) {
+      return { netPoints: 0, netShabbats: 0, shabbatExemptionPoints: 0, shosh: 0, mkutzarot: 0, baltams: 0 };
     }
-
-    let netPoints = 0;
-    let netShabbats = 0;
-    let shabbatExemptionPoints = 0;
-    let shosh = 0;
-    let mkutzarot = 0;
-
-    const userShifts = periodShiftsList.filter(s => String(s.userId) === String(userId));
-
-    userShifts.forEach(s => {
-      const type = typesList ? typesList.find(t => String(t.id) === String(s.shiftTypeId)) : null;
-      const typeName = type?.name || "";
-
-      const startDate = new Date(s.originalStart.includes('T') ? s.originalStart : `${s.originalStart}T00:00:00`);
-      const endDate = new Date(s.originalEnd.includes('T') ? s.originalEnd : `${s.originalEnd}T23:59:59`);
-      const startDay = startDate.getDay();
-      const endDay = endDate.getDay();
-
-      const originalShiftId = s.id ? s.id.toString().split('-')[0] : null;
-      const relevantExemptions = shiftExemptions.filter(ex =>
-        ex.shift_id && originalShiftId && String(ex.shift_id) === String(originalShiftId)
-      );
-
-      const petWeekendExemption = relevantExemptions.find(ex => {
-        if (ex.type !== 'pet') return false;
-        const exStart = new Date(ex.start_date.includes('T') ? ex.start_date : `${ex.start_date}T00:00:00`);
-        const exEnd = new Date(ex.end_date.includes('T') ? ex.end_date : `${ex.end_date}T23:59:59`);
-
-        let d = new Date(exStart);
-        while (d <= exEnd) {
-          if (d.getDay() === 6) return true;
-          d.setDate(d.getDate() + 1);
-        }
-        return false;
-      });
-
-      if (petWeekendExemption) {
-        const petStart = new Date(petWeekendExemption.start_date.includes('T') ? petWeekendExemption.start_date : `${petWeekendExemption.start_date}T00:00:00`);
-        const petEnd = new Date(petWeekendExemption.end_date.includes('T') ? petWeekendExemption.end_date : `${petWeekendExemption.end_date}T23:59:59`);
-        const petStartDay = petStart.getDay();
-        const petEndDay = petEnd.getDay();
-
-        if (petStartDay === 5) shosh += 1;
-        if (petEndDay === 6 || (endDay !== 6 && endDay >= 0)) mkutzarot += 1;
-      } else {
-        if (startDay === 0) mkutzarot += 1;
-        if (endDay === 5) shosh += 1;
-      }
-
-      let current = new Date(startDate);
-      const totalDaysInShift = Math.round((endDate - startDate) / (1000 * 60 * 60 * 24)) + 1;
-      let dayIndex = 0;
-      let shiftPointsAccumulator = 0;
-
-      while (current <= endDate) {
-        const isShabbat = current.getDay() === 6;
-        const dayOfWeek = current.getDay();
-
-        const hasExemption = relevantExemptions.some(ex => {
-          const exStart = new Date(ex.start_date.includes('T') ? ex.start_date : `${ex.start_date}T00:00:00`);
-          const exEnd = new Date(ex.end_date.includes('T') ? ex.end_date : `${ex.end_date}T23:59:59`);
-          return current >= exStart && current <= exEnd;
-        });
-
-        if (isShabbat) {
-          if (hasExemption) {
-            shabbatExemptionPoints += 1;
-          } else {
-            netShabbats += 1;
-          }
-        }
-
-        let dailyPoints = Number(type?.points_base || 1.0);
-        if (typeName.includes('שמירות')) {
-          if (dayIndex === 0 || dayIndex === totalDaysInShift - 1) dailyPoints = 0.5;
-        } else if (typeName.includes('מטבח')) {
-          if ((!s.isWeekend && dayOfWeek === 4) || (s.isWeekend && dayOfWeek === 1)) {
-            dailyPoints = 0.5;
-          }
-        }
-        shiftPointsAccumulator += dailyPoints;
-
-        current.setDate(current.getDate() + 1);
-        dayIndex++;
-      }
-
-      if (relevantExemptions.length > 0) {
-        let currentCheck = new Date(startDate);
-        let daysToSubtract = 0;
-        let dayIdx = 0;
-
-        while (currentCheck <= endDate) {
-          const isCovered = relevantExemptions.some(ex => {
-            const exStart = new Date(ex.start_date.includes('T') ? ex.start_date : `${ex.start_date}T00:00:00`);
-            const exEnd = new Date(ex.end_date.includes('T') ? ex.end_date : `${ex.end_date}T23:59:59`);
-            return currentCheck >= exStart && currentCheck <= exEnd;
-          });
-
-          if (isCovered) {
-            let dailyPoints = Number(type?.points_base || 1.0);
-            if (typeName.includes('שמירות')) {
-              if (dayIdx === 0 || dayIdx === totalDaysInShift - 1) dailyPoints = 0.5;
-            } else if (typeName.includes('מטבח')) {
-              const dayOfWeek = currentCheck.getDay();
-              if ((!s.isWeekend && dayOfWeek === 4) || (s.isWeekend && dayOfWeek === 1)) {
-                dailyPoints = 0.5;
-              }
-            }
-            daysToSubtract += dailyPoints;
-          }
-
-          currentCheck.setDate(currentCheck.getDate() + 1);
-          dayIdx++;
-        }
-
-        shiftPointsAccumulator = Math.max(0, shiftPointsAccumulator - daysToSubtract);
-      }
-
-      netPoints += shiftPointsAccumulator;
-    });
-
-    return {
-      netPoints: Number(netPoints.toFixed(2)),
-      netShabbats,
-      shabbatExemptionPoints: Number(shabbatExemptionPoints.toFixed(2)),
-      shosh,
-      mkutzarot,
-      shushCount: shosh,
-      mkuzeretCount: mkutzarot
-    };
+    return computeUserStats(userId, periodShiftsList, shiftTypes, shiftExemptions);
   };
 
   const soldierStats = selectedUserObj
-    ? getNetStats(selectedUserObj.id, displayedPeriodShifts, shiftTypes)
+    ? getNetStats(selectedUserObj.id, displayedPeriodShifts)
     : { netPoints: 0, netShabbats: 0, shabbatExemptionPoints: 0, shosh: 0, mkutzarot: 0 };
 
   const netPoints = soldierStats.netPoints;
   const netShabbats = soldierStats.netShabbats;
-
-  const calculateShiftPoints = (shift, exemptions, typesList) => {
-    const typeDetails = typesList.find(t => String(t.id) === String(shift.shift_type_id || shift.shiftTypeId));
-    let points = typeDetails ? Number(typeDetails.points_base) : 1.0;
-
-    const hasPetExemption = exemptions.some(ex =>
-      String(ex.shift_id) === String(shift.id) && ex.type === 'pet'
-    );
-
-    if (hasPetExemption && shift.is_weekend) {
-      points = Math.max(0, points - 1.0);
-    }
-
-    return points;
-  };
 
   const handleTimeChange = (e, field) => {
     const time = e.target.value;
@@ -1770,73 +1369,27 @@ function App() {
 
   const barColor = getProgressColor(netPoints, quota);
 
-  const getComparisonStats = (usersList, shiftsList, exemptions, typesList) => {
-    const holidayNames = ["ראש השנה", "יום כיפור", "סוכות", "פסח א'", "פסח ב'", "שבועות"];
-
-    return usersList.map(user => {
-      const userShifts = shiftsList.filter(s => String(s.userId) === String(user.id));
-      let statsObj = {
-        name: user.full_name,
-        totalPoints: 0,
-        shabbats: 0,
-        blatams: 0,
-        holidays: {},
-        shiftCounts: {}
-      };
-
-      userShifts.forEach(s => {
-        if (exemptions.some(ex => String(ex.shift_id) === String(s.id))) return;
-
-        const type = typesList.find(t => String(t.id) === String(s.shiftTypeId));
-        const typeName = type ? type.name : "לא ידוע";
-        statsObj.shiftCounts[typeName] = (statsObj.shiftCounts[typeName] || 0) + 1;
-
-        if (s.isWeekend) statsObj.shabbats += 1;
-        if (s.isBaltam) statsObj.blatams += 1;
-
-        if (s.holidayName) {
-          s.holidayName.split(', ').forEach(h => {
-            if (holidayNames.includes(h)) {
-              statsObj.holidays[h] = (statsObj.holidays[h] || 0) + 1;
-            }
-          });
-        }
-
-        statsObj.totalPoints += calculateShiftPoints(s, exemptions, typesList);
-      });
-      return statsObj;
-    });
-  };
-
-  const stats = useMemo(() => {
-    return getComparisonStats(users, shifts, shiftExemptions, shiftTypes);
-  }, [users, shifts, shiftExemptions, shiftTypes]);
-
   const progressPercentage = Math.min((netPoints / quota) * 100, 100);
 
   const start = selectedSlotDates?.startDate;
   const end = selectedSlotDates?.endDate;
   const hasShabbat = doesRangeContainShabbat(start, end);
 
-  const savePeriodsToServer = (updatedPeriods) => {
-    setCustomPeriods(updatedPeriods);
-    if (!currentUser || !currentUser.organization_id) return;
-
-    fetch(`${API_BASE}/api/periods`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        organization_id: currentUser.organization_id,
-        periods: updatedPeriods.map(p => ({
-          name: p.name,
-          start_date: p.startDate,
-          end_date: p.endDate
-        }))
-      })
-    })
-      .then(res => res.json())
-      .then(() => alert("התקופות נשמרו בשרת בהצלחה! 💾"))
-      .catch(err => console.error("שגיאה בשמירת תקופות:", err));
+  const savePeriodsToServer = async (updatedPeriods) => {
+    if (!currentUser?.organization_id) return;
+    try {
+      await api('/api/periods', {
+        method: 'POST',
+        body: {
+          periods: updatedPeriods.map(p => ({ name: p.name, start_date: p.startDate, end_date: p.endDate }))
+        }
+      });
+      setCustomPeriods(updatedPeriods);
+      alert("התקופות נשמרו בשרת בהצלחה! 💾");
+    } catch (err) {
+      // השרת בודק שאין שמות כפולים, תאריכים חסרים או תקופות חופפות
+      showError(err, "שגיאה בשמירת תקופות");
+    }
   };
 
   const iconButtonStyle = {
@@ -1851,6 +1404,10 @@ function App() {
     justifyContent: 'center',
     alignItems: 'center'
   };
+
+  if (!authChecked) {
+    return <div style={{ padding: '40px', direction: 'rtl', color: theme.darkgreen }}>טוען...</div>;
+  }
 
   if (!currentUser) {
     return (
@@ -2101,7 +1658,7 @@ function App() {
         boxSizing: 'border-box'
       }}>
         <div style={{ paddingBottom: '10px', marginBottom: '0px' }}>
-          <h2 style={{ margin: 0, color: theme.darkgreen }}>טייסת חופ"ה</h2>
+          <h2 style={{ margin: 0, color: theme.darkgreen }}>{currentUser.organization_name || 'מערכת תורנויות'}</h2>
           <span style={{ fontSize: '16px', color: theme.darkgreen }}>שלום, {currentUser.full_name}</span>
         </div>
 
@@ -2112,7 +1669,7 @@ function App() {
               const isSelected = selectedUserId === user.id;
               const performedBE = getNetStats(user.id, displayedPeriodShifts, shiftTypes);
               const performed = performedBE.netPoints;
-              const userQuota = totalPotential > 0 ? ((user.potential_reduction || 100) / totalPotential) * totalNetPointsInPeriod : 0;
+              const userQuota = totalPotential > 0 ? (potentialOf(user) / totalPotential) * totalNetPointsInPeriod : 0;
               const statusColor = getStatColor(performed, userQuota);
 
               return (
@@ -2124,7 +1681,6 @@ function App() {
                       setSelectedUserId(null);
                     } else {
                       setSelectedUserId(user.id);
-                      setSelectedPeriod("2026-07");
                       setIsPanelOpen(true);
                     }
                   }}
@@ -2159,7 +1715,12 @@ function App() {
 
         {currentUser.role === 'admin' && (
           <div style={{ display: 'flex', gap: '25px', marginTop: 'auto', paddingTop: '20px' }}>
-            <button onClick={() => setIsSettingsOpen(true)} style={iconButtonStyle}>
+            <button onClick={() => {
+              setAdminMyName(currentUser.full_name || '');
+              setAdminDoesShifts(currentUser.does_shifts === 1);
+              setAdminMyPassword('');
+              setIsSettingsOpen(true);
+            }} style={iconButtonStyle}>
               <FiSettings size={30} />
             </button>
 
@@ -2210,7 +1771,7 @@ function App() {
                   fontWeight: "bold"
                 }}
               >
-                סנכרן ליומן גוגל
+                {currentUser.calendar_connected ? 'יומן גוגל מחובר ✓' : 'סנכרן ליומן גוגל'}
               </button>
             )}
           </div>
@@ -2725,7 +2286,7 @@ function App() {
                       <div key={soldier.id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: theme.backgroundcolor, padding: '8px', borderRadius: '15px', border: `1px solid ${theme.darkgreen}` }}>
                         <span style={{ fontSize: '18px', fontWeight: 'bold' }}>{soldier.full_name}</span>
                         <div style={{ display: 'flex', gap: '5px' }}>
-                          <button onClick={() => setEditingSoldier({ id: soldier.id, full_name: soldier.full_name, password: '', release_date: soldier.release_date || '', potential_reduction: soldier.potential_reduction || 100, exemptionIds: soldier.exemptionIds || [], does_shifts: soldier.does_shifts })} style={{ background: theme.backgroundcolor, color: theme.darkgreen, border: `1px solid ${theme.darkgreen}`, borderRadius: '7px', padding: '3px 8px', cursor: 'pointer', fontSize: '12px' }}>ערוך</button>
+                          <button onClick={() => setEditingSoldier({ id: soldier.id, full_name: soldier.full_name, password: '', release_date: soldier.release_date || '', potential_reduction: soldier.potential_reduction ?? 100, exemptionIds: soldier.exemptionIds || [], does_shifts: soldier.does_shifts })} style={{ background: theme.backgroundcolor, color: theme.darkgreen, border: `1px solid ${theme.darkgreen}`, borderRadius: '7px', padding: '3px 8px', cursor: 'pointer', fontSize: '12px' }}>ערוך</button>
                           <button onClick={() => handleDeleteSoldier(soldier.id)} style={{ background: theme.backgroundcolor, color: theme.darkgreen, border: `1px solid ${theme.darkgreen}`, borderRadius: '7px', padding: '3px 8px', cursor: 'pointer', fontSize: '12px' }}>מחק</button>
                         </div>
                       </div>
@@ -3021,9 +2582,10 @@ function App() {
 
                         if (currentExemption && currentExemption.id) {
                           try {
-                            await fetch(`${API_BASE}/api/shift-exemptions/${currentExemption.id}`, { method: 'DELETE' });
+                            await api(`/api/shift-exemptions/${currentExemption.id}`, { method: 'DELETE' });
                           } catch (err) {
-                            console.error("שגיאה במחיקת החלפה:", err);
+                            showError(err, "שגיאה במחיקת החלפה");
+                            return;
                           }
                         }
 
@@ -3152,27 +2714,23 @@ function App() {
               return;
             }
 
-            const url = replacementData.id
-              ? `${API_BASE}/api/shift-exemptions/${replacementData.id}`
-              : `${API_BASE}/api/shift-exemptions`;
-
-            const method = replacementData.id ? 'PUT' : 'POST';
+            if (replacementForm.endDate < replacementForm.startDate) {
+              alert("תאריך הסיום לפני תאריך ההתחלה");
+              return;
+            }
 
             try {
-              const response = await fetch(url, {
-                method: method,
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
+              await api(replacementData.id ? `/api/shift-exemptions/${replacementData.id}` : '/api/shift-exemptions', {
+                method: replacementData.id ? 'PUT' : 'POST',
+                body: {
                   shift_id: editingShiftId,
                   start_date: replacementForm.startDate,
                   end_date: replacementForm.endDate,
                   type: replacementForm.type,
                   start_time: replacementForm.startTime || null,
                   end_time: replacementForm.endTime || null
-                })
+                }
               });
-
-              if (!response.ok) throw new Error("שגיאה בשמירת ההחלפה");
 
               alert(replacementData.id ? "ההחלפה עודכנה בהצלחה!" : "ההחלפה נוצרה בהצלחה!");
 
@@ -3181,8 +2739,7 @@ function App() {
               setReplacementData({ shift_id: '', start_date: '', end_date: '', type: 'pet' });
               fetchShiftExemptions();
             } catch (err) {
-              console.error(err);
-              alert("קרתה שגיאה, נסי שוב");
+              showError(err, "שגיאה בשמירת ההחלפה");
             }
           }}
           style={{
